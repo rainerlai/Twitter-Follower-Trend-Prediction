@@ -1,0 +1,96 @@
+gvkey,tic,cusip,conm,twitter_acc_1,twitter_url_1
+1161,AMD,7903107,ADVANCED MICRO DEVICES,AMD,https://twitter.com/AMD
+1447,AXP,25816109,AMERICAN EXPRESS CO,AmericanExpress,https://twitter.com/AmericanExpress
+1487,AIG,26874784,AMERICAN INTERNATIONAL GROUP,AIGinsurance,https://twitter.com/AIGinsurance
+1659,ANDE,34164103,ANDERSONS INC,andersonsgrain,https://twitter.com/andersonsgrain
+1878,ADSK,52769106,AUTODESK INC,autodesk,https://twitter.com/autodesk
+1919,AVT,53807103,AVNET INC,Avnet,https://twitter.com/Avnet
+1920,AVP,54303102,AVON PRODUCTS,AvonInsider,https://twitter.com/AvonInsider
+3170,CL,194162103,COLGATE-PALMOLIVE CO,Colgate,https://twitter.com/Colgate
+3226,CMCSA,20030N101,COMCAST CORP,comcast,https://twitter.com/comcast
+3336,DXC,23355L106,DXC TECHNOLOGY CO,DXCTechnology,https://twitter.com/DXCTechnology
+3708,WEN,95058W100,WENDY'S CO,Wendys,https://twitter.com/Wendys
+3814,AES5,23399M003,DPL INC,DPLToday,https://twitter.com/DPLToday
+4060,DD,26614N102,DUPONT DE NEMOURS INC,DuPont_News,https://twitter.com/DuPont_News
+4201,EV,278265103,EATON VANCE CORP,EatonVance,https://twitter.com/EatonVance
+4321,EMR,291011104,EMERSON ELECTRIC CO,Emerson_News,https://twitter.com/Emerson_News
+4839,F,345370860,FORD MOTOR CO,Ford,https://twitter.com/Ford
+4988,TGNA,87901J105,TEGNA INC,TEGNA,https://twitter.com/TEGNA
+5492,LHX,502431109,L3HARRIS TECHNOLOGIES INC,L3HarrisTech,https://twitter.com/L3HarrisTech
+5742,CNP,15189T107,CENTERPOINT ENERGY INC,CNPalerts,https://twitter.com/CNPalerts
+6435,KMB,494368103,KIMBERLY-CLARK CORP,KCCorp,https://twitter.com/KCCorp
+6788,RRC,75281A109,RANGE RESOURCES CORP,Range_Resources,https://twitter.com/Range_Resources
+6829,LOW,548661107,LOWE'S COS INC,Lowes,https://twitter.com/Lowes
+7163,SPGI,78409V104,S&P GLOBAL INC,SPGlobal,https://twitter.com/SPGlobal
+8113,OGE,670837103,OGE ENERGY CORP,OGandE,https://twitter.com/ogande
+8358,PH,701094104,PARKER-HANNIFIN CORP,ParkerHannifin,https://twitter.com/ParkerHannifin
+8402,PAYX,704326107,PAYCHEX INC,Paychex,https://twitter.com/Paychex
+8463,PNR,G7S00T104,PENTAIR PLC,Pentair,https://twitter.com/Pentair
+8479,PEP,713448108,PEPSICO INC,PepsiCo,https://twitter.com/PepsiCo
+8549,COP,20825C104,CONOCOPHILLIPS,conocophillips,https://twitter.com/conocophillips
+9599,SMTC,816850101,SEMTECH CORP,SemtechCorp,https://twitter.com/SemtechCorp
+9667,SHW,824348106,SHERWIN-WILLIAMS CO,SherwinWilliams,https://twitter.com/SherwinWilliams
+10005,SRCTQ,853887206,STANDARD REGISTER CO,Taylor_Comm,https://twitter.com/taylor_comm
+10247,SYY,871829107,SYSCO CORP,Sysco,https://twitter.com/Sysco
+10983,UTX,913017109,UNITED TECHNOLOGIES CORP,UTC,https://twitter.com/UTC
+11115,VAR,92220P105,VARIAN MEDICAL SYSTEMS INC,VarianMedSys,https://twitter.com/VarianMedSys
+11264,WBA,931427108,WALGREENS BOOTS ALLIANCE INC,Walgreens,https://twitter.com/Walgreens
+11304,AVA,05379B107,AVISTA CORP,AvistaUtilities,https://twitter.com/AvistaUtilities
+11584,FL,344849104,FOOT LOCKER INC,footlocker,https://twitter.com/footlocker
+11669,ZLC,988858106,ZALE CORP,ZalesJewelers,https://twitter.com/ZalesJewelers
+11770,SF,860630102,STIFEL FINANCIAL CORP,Stifel,https://twitter.com/Stifel
+12233,GENZ,372917104,GENZYME CORP,SanofiGenzyme,https://twitter.com/SanofiGenzyme
+12441,IT,366651107,GARTNER INC,Gartner_inc,https://twitter.com/Gartner_inc
+13092,JACK,466367109,JACK IN THE BOX INC,JackBox,https://twitter.com/JackBox
+14412,BID,835898107,SOTHEBY'S,Sothebys,https://twitter.com/sothebys
+17035,MCY,589400100,MERCURY GENERAL CORP,MercuryIns,https://twitter.com/MercuryIns
+21238,VICR,925815102,VICOR CORP,VicorPower,https://twitter.com/VicorPower
+23225,CABO,12685J105,CABLE ONE INC,sparklightcares,https://twitter.com/sparklightcares
+23252,ETH,297602104,ETHAN ALLEN INTERIORS INC,EthanAllenNYC,https://twitter.com/EthanAllenNYC
+24468,BIIB,09062X103,BIOGEN INC,biogen,https://twitter.com/biogen
+24800,QCOM,747525103,QUALCOMM INC,Qualcomm,https://twitter.com/Qualcomm
+25124,LIN,G5494J103,LINDE PLC,Lindeplc,https://twitter.com/Lindeplc
+25340,DHI,23331A109,D R HORTON INC,DRHorton,https://twitter.com/DRHorton
+25405,BGC,369300108,GENERAL CABLE CORP/DE,PrysmianGroup,https://twitter.com/PrysmianGroup
+26011,CPWR.1,205638109,COMPUWARE CORP,compuware,https://twitter.com/compuware
+27794,CREE,225447101,CREE INC,Cree,https://twitter.com/Cree
+27914,HUM,444859102,HUMANA INC,Humana,https://twitter.com/Humana
+28034,CB,H1467J104,CHUBB LTD,Chubb,https://twitter.com/Chubb
+28216,RGA,759351604,REINSURANCE GROUP AMER INC,RGA_RE,https://twitter.com/RGA_RE
+28303,PERY,288853104,ELLIS PERRY INTL INC,PEICorp,https://twitter.com/peicorp
+28629,CPT,133131102,CAMDEN PROPERTY TRUST,CamdenLiving,https://twitter.com/CamdenLiving
+28924,BKS,67774109,BARNES & NOBLE INC,BNBuzz,https://twitter.com/BNBuzz
+29011,BYD,103304101,BOYD GAMING CORP,boydgaming,https://twitter.com/boydgaming
+29241,VIAV,925550105,VIAVI SOLUTIONS INC,ViaviSolutions,https://twitter.com/ViaviSolutions
+29612,CGIPQ,150838100,CELADON GROUP INC,Celadon3PL,https://twitter.com/Celadon3PL
+29710,HNT,42222G108,HEALTH NET INC,HealthNet,https://twitter.com/HealthNet
+29751,ALB,12653101,ALBEMARLE CORP,AlbemarleCorp,https://twitter.com/AlbemarleCorp
+30138,JOSB,480838101,JOS A BANK CLOTHIERS INC,JosABank,https://twitter.com/JosABank
+61494,HSIC,806407102,HENRY SCHEIN INC,HenrySchein,https://twitter.com/HenrySchein
+65772,MTD,592688105,METTLER-TOLEDO INTL INC,mettlertoledo,https://twitter.com/mettlertoledo
+116504,SNBR,83125X103,SLEEP NUMBER CORP,sleepnumber,https://twitter.com/sleepnumber
+118502,CEB,125134106,CEB INC,CEB_Marketing,https://twitter.com/CEB_Marketing
+121718,JNPR,48203R104,JUNIPER NETWORKS INC,JuniperNetworks,https://twitter.com/JuniperNetworks
+122841,RHT,756577102,RED HAT INC,RedHat,https://twitter.com/RedHat
+126554,A,00846U101,AGILENT TECHNOLOGIES INC,Agilent,https://twitter.com/Agilent
+136725,ISRG,46120E602,INTUITIVE SURGICAL INC,IntuitiveSurg,https://twitter.com/IntuitiveSurg
+137131,CRL,159864107,CHARLES RIVER LABS INTL INC,CRiverLabs,https://twitter.com/CRiverLabs
+141384,ALGN,16255101,ALIGN TECHNOLOGY INC,Invisalign,https://twitter.com/invisalign
+145049,GME,36467W109,GAMESTOP CORP,GameStop,https://twitter.com/GameStop
+147661,AROPQ,00215Q103,ARO LIQUIDATION INC,Aeropostale,https://twitter.com/Aeropostale
+148470,RRGB,75689M101,RED ROBIN GOURMET BURGERS,redrobinburgers,https://twitter.com/redrobinburgers
+150139,DKS,253393102,DICKS SPORTING GOODS INC,DICKS,https://twitter.com/DICKS
+156617,ACOR,00484M106,ACORDA THERAPEUTICS INC,AcordaNews,https://twitter.com/AcordaNews
+160211,DPZ,25754A201,DOMINO'S PIZZA INC,dominos,https://twitter.com/dominos
+164416,IRBT,462726100,IROBOT CORP,iRobot,https://twitter.com/iRobot
+164664,CYNO,232577205,CYNOSURE INC,Cynosure_Lasers,https://twitter.com/Cynosure_Lasers
+165746,LYV,538034109,LIVE NATION ENTERTAINMENT,LiveNation,https://twitter.com/LiveNation
+170841,PSX,718546104,PHILLIPS 66,Phillips66Co,https://twitter.com/Phillips66Co
+174317,RVBD,768573107,RIVERBED TECHNOLOGY INC,riverbed,https://twitter.com/riverbed
+177376,DFS,254709108,DISCOVER FINANCIAL SVCS,Discover,https://twitter.com/Discover
+178493,CTCT,210313102,CONSTANT CONTACT INC,ConstantContact,https://twitter.com/ConstantContact
+178548,CML,20452A108,COMPELLENT TECHNOLOGIES INC,Dell,https://twitter.com/dell
+179666,LOGM,54142L109,LOGMEIN INC,LogMeIn,https://twitter.com/LogMeIn
+180402,HSNI,404303109,HSN INC,HSN,https://twitter.com/HSN
+180646,MYRG,55405W104,MYR GROUP INC,MYRGroupInc,https://twitter.com/MYRGroupInc
+184500,CBOE,12503M108,CBOE GLOBAL MARKETS INC,CBOE,https://twitter.com/CBOE

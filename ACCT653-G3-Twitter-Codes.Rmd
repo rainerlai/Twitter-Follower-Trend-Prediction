@@ -1,0 +1,2436 @@
+---
+title: "FFAProject"
+author: "Group3"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r helpers, warning=FALSE, echo=FALSE}
+suppressPackageStartupMessages(library(knitr))
+knitr::opts_chunk$set(echo = TRUE)
+local({
+  hook_plot = knit_hooks$get('plot')
+  knit_hooks$set(plot = function(x, options) {
+    paste0('\n\n----\n\n', hook_plot(x, options))
+  })
+})
+suppressPackageStartupMessages(library(kableExtra))
+html_df <- function(text, cols=NULL, col1=FALSE, full=F) {
+  if(!length(cols)) {
+    cols=colnames(text)
+  }
+  if(!col1) {
+    kable(text,"html", col.names = cols, align = c("l",rep('c',length(cols)-1))) %>%
+      kable_styling(bootstrap_options = c("striped","hover"), full_width=full)
+  } else {
+    kable(text,"html", col.names = cols, align = c("l",rep('c',length(cols)-1))) %>%
+      kable_styling(bootstrap_options = c("striped","hover"), full_width=full) %>%
+      column_spec(1,bold=T)
+  }
+}
+```
+
+
+```{r packages, warning=FALSE, echo=FALSE}
+#Load Packages
+suppressPackageStartupMessages(library(xts))
+suppressPackageStartupMessages(library(tidyr))
+suppressPackageStartupMessages(library(sarima))
+suppressPackageStartupMessages(library(forecast))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(lubridate))
+suppressPackageStartupMessages(library(zoo))
+suppressPackageStartupMessages(library(tidytext))
+suppressPackageStartupMessages(library(textdata))
+suppressPackageStartupMessages(library(imputeTS))
+suppressPackageStartupMessages(library(broom))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(plotly))
+suppressPackageStartupMessages(library(ROCR))
+suppressPackageStartupMessages(library(coefplot))
+suppressPackageStartupMessages(library(data.table))
+suppressPackageStartupMessages(library(lfe))
+suppressPackageStartupMessages(library(glmnet))
+```
+
+```{r Create functions - scoring ,predict.felm, kaggleoutput, echo=FALSE}
+# Mean Absolute Error function
+mae <- function(actual, predicted) {
+  sum(abs(actual-predicted))/length(actual)
+}
+# Create predict function for fixed effect models
+predict.felm <- function(object, newdata, use.fe=T, ...) {
+  # compatible with tibbles
+  newdata <- as.data.frame(newdata)
+  co <- coef(object)
+  
+  y.pred <- t(as.matrix(unname(co))) %*% t(as.matrix(newdata[,names(co)]))
+  
+  fe.vars <- names(object$fe)
+  
+  all.fe <- getfe(object)
+  for (fe.var in fe.vars) {
+    level <- all.fe[all.fe$fe == fe.var,]
+    frows <- match(newdata[[fe.var]],level$idx)
+    myfe <- level$effect[frows]
+    myfe[is.na(myfe)] = 0
+      
+    y.pred <- y.pred + myfe
+  }
+  as.vector(y.pred)
+}
+# Create Kaggle csv output function 
+kaggleoutput <- function(filename, df) {
+    #' Returns Kaggle compatible output for submission 
+    #'
+    #' @param filename is the name of file to be created
+    #' @param df The dataframe containing "ID" and "followers" columns to be extracted
+    #' example use: kaggleoutput("output.csv", dataframe_input)
+  f <- paste0("Data_Files/3output/",filename)
+  
+  if (file.exists(f)) {
+    cat("\n", f, "already created")
+  } else {
+    write.csv(df[, c("ID", "followers")], f, row.names = FALSE)
+    cat("\nNew", f, "created")
+  }
+}
+```
+
+#### Preparation: Data Extraction - Tweets information from rtweets package
+
+Extract the last 3200 tweets information from API and merged into one single dataframe
+
+A rtweets data file and master data file are generated and saved separately for subsequent models creation, as it takes a long time to generate each of the dataset. 
+Note that as rtweets API the last 3200 tweets information from Twitter, the data extracted now will be different from the tweets data extracted in February.
+
+```{r rtweetextract, eval=FALSE, warning=FALSE}
+suppressPackageStartupMessages(library(rtweet))
+# Code retrieves the tweets based on the manually identified twitter handles and puts them into a single Dataframe. Will take at least 30min to run on an i5 Intel processor. API limits retrieval to 3200 past tweets as of date this function is run. 
+
+#Tweet retrieval function
+df_keys <-
+  read.csv("Data_Files/1raw/gvkey_tic_cusip_conm_TwitterAcc.csv", stringsAsFactors = FALSE)
+t_acc_list <- df_keys$twitter_acc_1
+for (i in t_acc_list[1:3]) {
+  if (i == t_acc_list[1]) {
+    df_rawtweets <- get_timeline(i, n = 3200)
+    df_rawtweets <-
+      df_rawtweets[as.Date(df_rawtweets$created_at) < "2017-10-01", ]
+  } else {
+    df_temp <- get_timeline(i, n = 3200)
+    if (nrow(df_temp) > 0) {
+      df_temp <- df_temp[as.Date(df_temp$created_at) < "2017-10-01", ]
+      if (nrow(df_temp) > 0) {
+        df_rawtweets <- rbind(df_rawtweets, df_temp)
+      }
+    }
+  }
+}
+df_rawtweets <-
+  left_join(df_rawtweets, df_keys[, c("gvkey", "twitter_acc_1")], by = c("screen_name" =
+                                                                           "twitter_acc_1"))
+
+# Save extracted rtweets data into csv
+f <- paste0("Data_Files/2processed/rawtweets.csv")
+if (file.exists(f)) {
+  cat("\n", f, "already created")
+} else {
+  fwrite(df_rawtweets, file = f)
+  cat("\nNew",f,"created")
+}
+
+```
+
+
+```{r dataset, eval=TRUE, echo=FALSE, echo=FALSE}
+df_train <- read.csv("Data_Files/1raw/Followers_train.csv", stringsAsFactors=FALSE)
+train <- df_train
+df_test <- read.csv("Data_Files/1raw/Followers_test.csv",stringsAsFactors = FALSE)
+test <- df_test
+df_keys <- read.csv("Data_Files/1raw/gvkey_tic_cusip_conm_TwitterAcc.csv", stringsAsFactors = FALSE)
+df_gics <- read.csv("Data_Files/1raw/gvkey_gics.csv",stringsAsFactors = FALSE)
+df_gicsmap <- read.csv("Data_Files/1raw/GICS_map_2018.csv", stringsAsFactors = FALSE)
+df_stockpx <- read.csv("Data_Files/1raw/DailyStockPrice.csv", stringsAsFactors = FALSE)
+stockpx <- df_stockpx
+df_accdata <- read.csv("Data_Files/1raw/AnnualFinancials.csv", stringsAsFactors = FALSE)
+df_qaccdata <- read.csv("Data_Files/1raw/QuarterlyFinancials.csv", stringsAsFactors = FALSE)
+df_tweets<-read.csv("Data_Files/2processed/rawtweets.csv",stringsAsFactors = FALSE)
+tweets <- df_tweets
+```
+
+# Report Section 2: Exploratory Data Analysis of Training Dataset
+
+
+```{r train_eda, warning=FALSE, eval=TRUE, echo=FALSE}
+# Summary of df_train
+df_train_temp <- df_train
+summary(df_train_temp)
+# No. of unique gvkey (companies)
+cat("\nThere are" , length(unique(df_train_temp$gvkey)), "unique gvkeys in the training dataset (df_train). The gvkeys are: \n\n", paste(unique(df_train_temp$gvkey), collapse=","))
+# Check if all gvkeys in test appears in training
+df_check <- (1.0*(df_test$gvkey %in% df_train$gvkey))
+cat("\nThere are" , length(df_check[df_check == 0]), "unique gvkeys in the test dataset (df_test), which are not in training dataset (df_train)")
+```
+
+_Analysis_:
+With the exception of Wendy's (gvkey=3708), majority of companies had gained an average of under 5779 followers per day. For majority of companies, the change in followers over time is reletively consistent.
+```{r Plot Change in Followers, warning=FALSE, eval=TRUE, echo=FALSE}
+# Convert date data into date type
+df_train_temp$date <- as.Date(as.character(df_train_temp$date),format="%Y%m%d")
+# Plot summary data - basic
+plot_train_basic <- ggplot(df_train_temp, aes(x=date, y=followers, color=factor(gvkey))) +
+  geom_line() + theme(legend.position="none") + ggtitle("Changes in followers over time ")
+ggplotly(plot_train_basic) 
+```
+
+```{r Plot average change in followers, eval=TRUE, echo=FALSE}
+plot_train_ave_followers <- df_train_temp %>% arrange(gvkey, date) %>% 
+                        group_by(gvkey) %>% 
+                        mutate(startdate = min(date),
+                               enddate = max(date),
+                               daysgap = enddate-startdate,
+                               followersgap = tail(followers, 1)-head(followers,1)) %>%
+                        dplyr::slice(1) %>%
+                        ungroup()
+plot_train_ave_followers_wo3708 <- df_train_temp %>% arrange(gvkey, date) %>% 
+                        group_by(gvkey) %>% 
+                        filter(gvkey != 3708) %>%
+                        mutate(startdate = min(date),
+                               enddate = max(date),
+                               daysgap = enddate-startdate,
+                               followersgap = tail(followers, 1)-head(followers,1)) %>%
+                        dplyr::slice(1) %>%
+                        ungroup()
+cat("\nOn average the company's followers increased by" , sum(plot_train_ave_followers$followersgap)/95)
+cat("\nExcluding GVKEY 3708, on average the company's followers increased by", sum(plot_train_ave_followers_wo3708$followersgap)/94)
+```
+
+
+```{r Plot change between first and last date, warning=FALSE, eval=TRUE, echo=FALSE}
+# Plot start-end difference
+plot_train_startend <- df_train_temp %>% arrange(gvkey, date) %>% 
+                        group_by(gvkey) %>% 
+                        mutate(startdate = min(date),
+                               enddate = max(date),
+                               daysgap = enddate-startdate,
+                               followersgap = tail(followers, 1)-head(followers,1)) %>%
+                        dplyr::slice(1) %>%
+                        ungroup() %>%
+                        ggplot(aes(x=factor(daysgap), y=followersgap, color=factor(gvkey)))+
+                          geom_jitter()+
+                          theme(legend.position="none")+
+                          labs(x="No. of days between first and last date in df_train", 
+                               y="Change in followers between first and last date in df_train")+
+                          ggtitle("Change in followers between first and last date in df_train ")
+                          
+ggplotly(plot_train_startend)
+```
+
+```{r PLot change between first and laste date exlcude gvkeys, warning=FALSE, eval=TRUE, echo=FALSE}
+# Plot start-end difference
+plot_train_startend_excl3708 <- df_train_temp %>% arrange(gvkey, date) %>% 
+                        group_by(gvkey) %>% 
+                        filter(gvkey != 3708) %>% 
+                        mutate(startdate = min(date),
+                               enddate = max(date),
+                               daysgap = enddate-startdate,
+                               followersgap = tail(followers, 1)-head(followers,1)) %>%
+                        dplyr::slice(1) %>%
+                        ungroup() %>%
+                        ggplot(aes(x=factor(daysgap), y=followersgap, color=factor(gvkey)))+
+                          geom_jitter()+
+                          theme(legend.position="none")+
+                          labs(x="No. of days between first and last date in df_train", 
+                               y="Change in followers")+
+                          ggtitle("Change in followers between first and last date in df_train \n(Excluding gvkey=3708) ")
+                          
+ggplotly(plot_train_startend_excl3708)
+```
+
+_Analysis_:
+With the exception of Wendy's (gvkey=3708) and Dell (gvkey=178548) , majority of companies under 10000 followers per day.
+
+```{r Plot daily change in followers, warning=FALSE, eval=TRUE, echo=FALSE}
+# Plot daily change over training period
+plot_train_dailychange <- df_train_temp %>% arrange(gvkey, date) %>% 
+                            group_by(gvkey) %>% 
+                            mutate(dailychange = followers-lag(followers))%>% 
+                            ungroup() %>%
+                            ggplot(aes(x=date, y=dailychange, color=factor(gvkey))) +
+                              geom_line() +
+                              theme(legend.position="none") +
+                              labs(x="Date", y="Daily change in followers (current minus lag)")+
+                          ggtitle("Daily change in followers")
+ggplotly(plot_train_dailychange)
+```
+
+```{r Plot daily change in followers exclude gvkeys, warning=FALSE, eval=TRUE, echo=FALSE}
+# Plot daily change over training period
+plot_train_dailychange <- df_train_temp %>% arrange(gvkey, date) %>% 
+                            group_by(gvkey) %>% 
+                            filter(gvkey != 3708 & gvkey != 178548) %>% 
+                            mutate(dailychange = followers-lag(followers))%>% 
+                            ungroup() %>%
+                            ggplot(aes(x=date, y=dailychange, color=factor(gvkey))) +
+                              geom_line() +
+                              theme(legend.position="none") +
+                              labs(x="Date", y="Daily change in followers (current minus lag)")+
+                              ggtitle("Daily change in followers \n(excluding gvkeys 3708 & 178548)")
+ggplotly(plot_train_dailychange)
+```
+_Analysis_:
+With the exception of Wendy's (gvkey=3708) and Dell (gvkey=178548) , majority of companies under 1000 followers per day.
+
+```{r Plot lag followers vs followers, warning=FALSE, eval=TRUE, echo=FALSE}
+# Plot regression of lag(followers) vs followers
+plot_train_lagfollowersvsfollowers <- df_train_temp %>% arrange(gvkey, date) %>% 
+                                        group_by(gvkey) %>% 
+                                        mutate(followers_lag = lag(followers))%>% 
+                                        ungroup() %>%
+                                        ggplot(aes(x=followers_lag, y=followers, color=factor(gvkey))) +
+                                          geom_point(na.rm=TRUE) +
+                                          theme(legend.position="none") +
+                                          labs(x="Lag Followers", y="Followers") +
+                                          geom_smooth(method='lm',formula=followers~followers_lag) +
+                                          ggtitle("Lag Followers vs Followers")
+ggplotly(plot_train_lagfollowersvsfollowers)
+```
+
+_Analysis_:
+The plot shows that the change in followers across all companies is not volatile and tends to follow the AB line. It may suggest that lag follower counts can be used to predict lead follower count. This relationship seems to also hold for Wendy's (gvkey 3708) during the exceptional increase in number of followers.
+
+This suggests that the use of a Autoregressive time-series model may be useful.
+
+```{r Plot change in followers by industry, warning=FALSE, eval=TRUE, echo=FALSE}
+# Industry sectors
+df_industry_temp <- unique(df_gics[,c("gvkey","gsector","ggroup","gind","gsubind")])
+rownames(df_industry_temp) <- NULL
+df_industry_temp <- left_join(df_industry_temp, unique(df_gicsmap[,c("gics_sector","gics_sector_des")]), by=c("gsector"="gics_sector"))
+df_industry_temp <- left_join(df_industry_temp, unique(df_gicsmap[,c("gics_indgrp","gics_indgrp_des")]), by=c("ggroup"="gics_indgrp"))
+df_industry_temp <- left_join(df_industry_temp, unique(df_gicsmap[,c("gics_ind","gics_ind_des")]), by=c("gind"="gics_ind"))
+df_industry_temp <- left_join(df_industry_temp, unique(df_gicsmap[,c("gics_subind","gics_subind_des")]), by=c("gsubind"="gics_subind"))
+# Plot summary data by gics sector -- can also plot by gics group, industry or sub-industry
+plot_train_bysector <- df_train_temp %>% left_join(df_industry_temp, by="gvkey") %>%
+                                    ggplot(aes(x=date, y=followers, color=factor(gics_sector_des))) +
+                                      geom_line() +
+                                      facet_wrap(~gics_sector_des) +
+                                      labs(x="Date", y="Followers", color="GICS Sector") +
+                                      ggtitle("Change in followers by sector")
+                                      
+ggplotly(plot_train_bysector) 
+```
+
+_Analysis_:
+Majority of the twitter followers belong to 5 key sectors:
+- Communications sector
+- Consumer discretionary
+- Consumer staples
+- Financials
+- Information technology
+
+This makes sense given that these 5 key industries has clear marketing need to engage end-consumers through twitter.
+
+
+```{r Plot distribution of change in followers by industry, echo=FALSE, warning=FALSE}
+# Plot summary data by gics sector -- can also plot by gics group, industry or sub-industry
+plot_train_bysector <- df_train_temp %>% left_join(df_industry_temp, by="gvkey") %>% arrange(gvkey, date) %>% 
+                          group_by(gvkey) %>%
+                          filter(gvkey != 3708) %>%
+                          mutate(startdate = min(date),
+                                  enddate = max(date),
+                                  daysgap = as.numeric(enddate-startdate),
+                                  followersgap = tail(followers, 1)-head(followers,1),
+                                  meanchange =  followersgap/daysgap)%>%
+                          dplyr::slice(1) %>%
+                          ungroup() %>%
+                                    ggplot(aes(x=gics_sector_des, y=followersgap, color=factor(gics_sector_des))) +
+                                      geom_violin(scale="width") +
+                                      ggtitle("Distribution of change in followers by sector \n (excluding gvkey =3708)") +
+                                      theme(axis.text.x = element_text(angle =90, hjust = 1, vjust = 0.5))
+                                      
+ggplotly(plot_train_bysector)
+```
+_Analysis_:
+
+Most companies seem to progressively increase their follower count. 
+Most company's change in follower count tends to be in the range of 0 to 10,000.
+The companies with the biggest follower count increase tends to only be in the following industries:
+Consumer Discretionary
+Information Technology
+
+This means that it is likley that the indiviudal sector a company belongs to will have an effect 
+on its' behaviour and thus actions which lead to increased twitter followers.
+
+
+
+```{r Generate masterdata for OLS and LASSO, warning=FALSE, eval=FALSE, echo=FALSE}
+
+# Datasets Merging - Master Data Preparation (with financial data)
+#The following codes merge all the data files (training, testing, twitter account names, Compustats, industry mapping into one single masterdata). Some computations have been done to compute the financial ratios, lags, rate of change, growth rate and Tweets information etc. 
+daysgap <- function(datadate,gap) {
+  duration <- interval(ymd(lag(datadate,gap)), ymd(datadate))
+  return(round(time_length(duration, "days")))
+}
+monthsgap <- function(datadate,gap) {
+  duration <- interval(ymd(lag(datadate,gap)), ymd(datadate))
+  return(round(time_length(duration, "months")))
+}
+# Get training data followers count statistic and variables
+df_train <- df_train %>% arrange(gvkey, date) %>% group_by(gvkey) %>% 
+  mutate(follower_trainavgchgmean = ((tail(followers,1)-head(followers,1))/time_length(interval(ymd(min(date)),ymd(max(date))),"days")) /head(followers,1)) %>% ungroup()
+df_test$followers <- NA
+df_test$follower_trainavgchgmean <- NA         
+df_master <-  rbind(df_train, df_test)
+df_master <- df_master %>% arrange(gvkey, date) %>%
+  group_by(gvkey) %>% mutate(followers_chg = ifelse(is.na(lag(followers)|lag(followers,2)), NA, lag(followers)-lag(followers,2)),
+                             followers_chgabsdaily = followers_chg/(lag(date)-lag(date,2)),
+                             followers_chgptcdaily = ifelse(is.na(followers_chgabsdaily | lag(followers,2)), NA, 
+                                                            followers_chgabsdaily/lag(followers,2)),
+                             followers_fixmean = ifelse(is.na(follower_trainavgchgmean),
+                                                        head(follower_trainavgchgmean,1),follower_trainavgchgmean),
+                             followers_lag1 = ifelse(daysgap(date,1)==1,lag(followers),NA),
+                             followers_lag2 = ifelse(daysgap(date,2)==2,lag(followers,2),NA),
+                             followers_lag3 = ifelse(daysgap(date,3)==3,lag(followers,3),NA),
+                             followers_lag4 = ifelse(daysgap(date,4)==4,lag(followers,4),NA),
+                             followers_lag5 = ifelse(daysgap(date,5)==5,lag(followers,5),NA),
+                             followers_lag6 = ifelse(daysgap(date,6)==6,lag(followers,6),NA),
+                             followers_lag7 = ifelse(daysgap(date,7)==7,lag(followers,7),NA)) %>% ungroup()
+# Get twitter account names
+df_master <- left_join(df_master, df_keys[,c("gvkey","twitter_acc_1","twitter_url_1")], by="gvkey")
+# Get industry sectors
+df_industry <- unique(df_gics[,c("gvkey","gsector","ggroup","gind","gsubind")])
+rownames(df_industry) <- NULL
+df_industry <- left_join(df_industry, unique(df_gicsmap[,c("gics_sector","gics_sector_des")]), by=c("gsector"="gics_sector"))
+df_industry <- left_join(df_industry, unique(df_gicsmap[,c("gics_indgrp","gics_indgrp_des")]), by=c("ggroup"="gics_indgrp"))
+df_industry <- left_join(df_industry, unique(df_gicsmap[,c("gics_ind","gics_ind_des")]), by=c("gind"="gics_ind"))
+df_industry <- left_join(df_industry, unique(df_gicsmap[,c("gics_subind","gics_subind_des")]), by=c("gsubind"="gics_subind"))
+df_master <- left_join(df_master, df_industry[,c("gvkey","gics_sector_des","gics_indgrp_des","gics_ind_des","gics_subind_des")],
+                       by="gvkey")
+# Compute financial ratios (annual) and append into master data
+df_accdata <- df_accdata[(df_accdata$datadate > 20141231 & df_accdata$datadate <= 20170930),]
+df_accdata$date <- as.Date(as.character(df_accdata$datadate),format="%Y%m%d")
+df_accdata$month <- month(as.POSIXlt(df_accdata$date, format="%Y-%m-%d"))
+df_accdata$year <- year(as.POSIXlt(df_accdata$date, format="%Y-%m-%d"))
+df_accdata[is.na(df_accdata$che),]$che <- 0
+df_accdata[is.na(df_accdata$lct),]$lct <- 0
+df_accdata[is.na(df_accdata$dlc),]$dlc <- 0
+df_accdata[is.na(df_accdata$mibt),]$mibt <- 0
+df_accdata <- df_accdata[!df_accdata$indfmt=="FS",]
+df_accdata <- df_accdata %>% arrange(gvkey, datadate) %>% 
+  group_by(gvkey) %>% 
+  mutate(pm = ebit/revt,
+         pm_lag = ifelse(fyear-lag(fyear)==1,lag(pm),NA),
+         aturn = revt/((at-che)-(lct-dlc)),
+         aturn_lag = ifelse(fyear-lag(fyear)==1,lag(aturn),NA),
+         roc = pm/aturn,
+         roc_lag = ifelse(fyear-lag(fyear)==1,lag(roc),NA),
+         gpa = (revt-cogs)/at,
+         gpa_lag = ifelse(fyear-lag(fyear)==1,lag(gpa),NA),
+         lev = dltt/at,
+         lev_lag = ifelse(fyear-lag(fyear)==1,lag(lev),NA),
+         eyield = ebit/(mkvalt+(dlc+dltt)-che+pstk+mibt),
+         eyield_lag = ifelse(fyear-lag(fyear)==1,lag(eyield),NA),
+         divpo = dvpsp_f/epspi,
+         divpo_lag = ifelse(fyear-lag(fyear)==1,lag(divpo),NA),
+         bm = (seq + txditc - pstk) / mkvalt,
+         bm_lag = ifelse(fyear-lag(fyear)==1,lag(bm),NA),
+         revt_lag = ifelse(fyear-lag(fyear)==1,lag(revt),NA),
+         revt_growth = (revt-revt_lag)/revt_lag,
+         optdr_lag = ifelse(fyear-lag(fyear)==1,lag(optdr),NA),
+         auop_lag = ifelse(fyear-lag(fyear)==1,lag(auop),NA)) %>% ungroup()
+                                                                                  
+df_master <- left_join(df_master,df_accdata[,c("gvkey","fyr")], by="gvkey")
+df_master <- unique(df_master)
+df_master$date <- as.Date(as.character(df_master$date),format="%Y%m%d")
+df_master$tempyr <- as.numeric(format(df_master$date, format="%Y"))
+df_master$tempmth_yr <- as.Date(as.yearmon(format(df_master$date, format="%Y-%m")))
+df_master$tempfy1 <- as.Date(as.yearmon(paste0((df_master$tempyr-1),"-",df_master$fyr)))
+df_master$tempfy2 <- as.Date(as.yearmon(paste0(df_master$tempyr,"-",df_master$fyr)))
+df_master$fyear <- ifelse((time_length(interval(df_master$tempfy1,df_master$tempmth_yr),"months"))>0 & 
+                               (time_length(interval(df_master$tempfy1,df_master$tempmth_yr),"months"))<=12, df_master$tempyr-1, 
+                          ifelse((time_length(interval(df_master$tempfy2,df_master$tempmth_yr),"months"))>0 & 
+                                   (time_length(interval(df_master$tempfy2,df_master$tempmth_yr),"months"))<=12,
+                                 df_master$tempyr,NA))
+df_master <- df_master[,!(names(df_master)%in% c("tempyr","tempmth_yr","tempfy1","tempfy2"))]
+df_master <- left_join(df_master,df_accdata[,c("gvkey","fyr","fyear","pm","pm_lag","aturn","aturn_lag","roc","roc_lag",
+                                  "gpa","gpa_lag","lev","lev_lag","eyield","eyield_lag","divpo","divpo_lag","bm","bm_lag",
+                                  "revt","revt_lag","revt_growth","optdr_lag","dlrsn","dldte","auop","auop_lag","spcsrc")],
+                       by=c("gvkey","fyear","fyr"))
+# Compute financial ratios (quarter) and append into master data
+df_qaccdata <- df_qaccdata[(df_qaccdata$datadate > 20141231 & df_qaccdata$datadate <= 20170930),]
+df_qaccdata$dateq <- as.Date(as.character(df_qaccdata$datadate),format="%Y%m%d")
+df_qaccdata <- df_qaccdata %>% arrange(gvkey,datadate) %>% group_by(gvkey) %>% mutate(datetoq = lead(dateq)) %>% ungroup()
+df_qaccdata[is.na(df_qaccdata$cheq),]$cheq <- 0
+df_qaccdata[is.na(df_qaccdata$lctq),]$lctq <- 0
+df_qaccdata[is.na(df_qaccdata$dlcq),]$dlcq <- 0
+df_qaccdata[is.na(df_qaccdata$mibtq),]$mibtq <- 0
+df_qaccdata <- df_qaccdata[!df_qaccdata$indfmt=="FS",]
+df_qaccdata <- df_qaccdata %>% 
+  arrange(gvkey, datafqtr) %>% 
+  group_by(gvkey) %>% 
+  mutate(pmq = niq/revtq,
+         pmq_lag1= ifelse(monthsgap(datadate,1)==3,lag(pmq),NA),
+         pmq_lag2= ifelse(monthsgap(datadate,2)==6,lag(pmq,2),NA),
+         pmq_lag3= ifelse(monthsgap(datadate,3)==9,lag(pmq,3),NA),
+         pmq_lag4= ifelse(monthsgap(datadate,4)==12,lag(pmq,4),NA),
+         aturnq = revtq/((atq-cheq)-(lctq-dlcq)),
+         aturnq_lag1 = ifelse(monthsgap(datadate,1)==3,lag(aturnq),NA),
+         aturnq_lag2 = ifelse(monthsgap(datadate,2)==6,lag(aturnq,2),NA),
+         aturnq_lag3 = ifelse(monthsgap(datadate,3)==9,lag(aturnq,3),NA),
+         aturnq_lag4 = ifelse(monthsgap(datadate,4)==12,lag(aturnq,4),NA),
+         rocq = pmq/aturnq,
+         rocq_lag1 = ifelse(monthsgap(datadate,1)==3,lag(rocq),NA),
+         rocq_lag2 = ifelse(monthsgap(datadate,2)==6,lag(rocq,2),NA),
+         rocq_lag3 = ifelse(monthsgap(datadate,3)==9,lag(rocq,3),NA),
+         rocq_lag4 = ifelse(monthsgap(datadate,4)==12,lag(rocq,4),NA),
+         gpaq = (revtq-cogsq)/atq,
+         gpaq_lag1 = ifelse(monthsgap(datadate,1)==3,lag(gpaq),NA),
+         gpaq_lag2 = ifelse(monthsgap(datadate,2)==6,lag(gpaq,2),NA),
+         gpaq_lag3 = ifelse(monthsgap(datadate,3)==9,lag(gpaq,3),NA),
+         gpaq_lag4 = ifelse(monthsgap(datadate,4)==12,lag(gpaq,4),NA),
+         levq = dlttq/atq,
+         levq_lag1 = ifelse(monthsgap(datadate,1)==3,lag(levq),NA),
+         levq_lag2 = ifelse(monthsgap(datadate,2)==6,lag(levq,2),NA),
+         levq_lag3 = ifelse(monthsgap(datadate,3)==9,lag(levq,3),NA),
+         levq_lag4 = ifelse(monthsgap(datadate,4)==12,lag(levq,4),NA),
+         eyieldq = niq/(mkvaltq+(dlcq+dlttq)-cheq+pstkq+mibtq),
+         eyieldq_lag1 = ifelse(monthsgap(datadate,1)==3,lag(eyieldq),NA),
+         eyieldq_lag2 = ifelse(monthsgap(datadate,2)==6,lag(eyieldq,2),NA),
+         eyieldq_lag3 = ifelse(monthsgap(datadate,3)==9,lag(eyieldq,3),NA),
+         eyieldq_lag4 = ifelse(monthsgap(datadate,4)==12,lag(eyieldq,4),NA),
+         divpoq = dvpspq/epspiq,
+         divpoq_lag1 = ifelse(monthsgap(datadate,1)==3,lag(divpoq),NA),
+         divpoq_lag2 = ifelse(monthsgap(datadate,2)==6,lag(divpoq,2),NA),
+         divpoq_lag3 = ifelse(monthsgap(datadate,3)==9,lag(divpoq,3),NA),
+         divpoq_lag4 = ifelse(monthsgap(datadate,4)==12,lag(divpoq,4),NA),
+         bmq = (seqq + txditcq - pstkq) / mkvaltq,
+         bmq_lag1 = ifelse(monthsgap(datadate,1)==3,lag(bmq),NA),
+         bmq_lag2 = ifelse(monthsgap(datadate,2)==6,lag(bmq,2),NA),
+         bmq_lag3 = ifelse(monthsgap(datadate,3)==9,lag(bmq,3),NA),
+         bmq_lag4 = ifelse(monthsgap(datadate,4)==12,lag(bmq,4),NA),
+         revtq_lag1 = ifelse(monthsgap(datadate,1)==3,lag(revtq),NA),
+         revtq_lag2 = ifelse(monthsgap(datadate,2)==6,lag(revtq,2),NA),
+         revtq_lag3 = ifelse(monthsgap(datadate,3)==9,lag(revtq,3),NA),
+         revtq_lag4 = ifelse(monthsgap(datadate,4)==12,lag(revtq,4),NA),
+         revtq_growth1 = (revtq-revtq_lag1)/revtq_lag1,
+         revtq_growth2 = (revtq_lag1-revtq_lag2)/revtq_lag1,
+         revtq_growth3 = (revtq_lag2-revtq_lag3)/revtq_lag2,
+         revtq_growth4 = (revtq_lag3-revtq_lag4)/revtq_lag3,
+         optdrq_lag1 = ifelse(monthsgap(datadate,1)==3,lag(optdrq),NA),
+         optdrq_lag2 = ifelse(monthsgap(datadate,2)==6,lag(optdrq,2),NA),
+         optdrq_lag3 = ifelse(monthsgap(datadate,3)==9,lag(optdrq,3),NA),
+         optdrq_lag4 = ifelse(monthsgap(datadate,4)==12,lag(optdrq,4),NA)) %>% ungroup()
+findqtrdates <- inner_join(df_master[,c("gvkey","date")],df_qaccdata[,c("gvkey","dateq","datetoq")], by=c("gvkey"))%>% 
+  mutate(mdateq = ifelse((date>dateq & date<=datetoq),dateq, NA))
+findqtrdates <- findqtrdates[!is.na(findqtrdates$mdateq),]
+df_master <- left_join(df_master,findqtrdates[,c("gvkey","date","dateq")],by=c("gvkey","date"))
+qaccdate_col <- c('gvkey','dateq','pmq','pmq_lag1','pmq_lag2','pmq_lag3','pmq_lag4','aturnq','aturnq_lag1','aturnq_lag2',
+                  'aturnq_lag3','aturnq_lag4','rocq','rocq_lag1','rocq_lag2','rocq_lag3','rocq_lag4','gpaq','gpaq_lag1','gpaq_lag2',
+                  'gpaq_lag3','gpaq_lag4','levq','levq_lag1','levq_lag2','levq_lag3','levq_lag4','eyieldq','eyieldq_lag1',
+                  'eyieldq_lag2','eyieldq_lag3','eyieldq_lag4','divpoq','divpoq_lag1','divpoq_lag2','divpoq_lag3','divpoq_lag4',
+                  'bmq','bmq_lag1','bmq_lag2','bmq_lag3','bmq_lag4','revtq','revtq_lag1','revtq_lag2','revtq_lag3','revtq_lag4',
+                  'revtq_growth1','revtq_growth2','revtq_growth3','revtq_growth4','optdrq_lag1','optdrq_lag2','optdrq_lag3',
+                  'optdrq_lag4')
+df_master <- left_join(df_master,df_qaccdata[,qaccdate_col], by=c("gvkey","dateq"))
+# Compute stock price lags and changes, and append into master data
+df_stockpx <- df_stockpx[df_stockpx$iid=="01",]
+df_stockpx$date <- ymd(df_stockpx$datadate)
+df_stockpx <- df_stockpx[(df_stockpx$datadate > 20141231 & df_stockpx$datadate <= 20170930),]
+df_stockpx$date <- as.Date(as.character(df_stockpx$datadate),format="%Y%m%d")
+df_stockpx <- df_stockpx %>% 
+  arrange(gvkey, datadate) %>% 
+  group_by(gvkey) %>% 
+  mutate(stockpx_lag1 = ifelse(daysgap(datadate,1)==1,lag(prccd),NA),
+         stockpx_lag2 = ifelse(daysgap(datadate,2)==2,lag(prccd,2),NA),
+         stockpx_lag3 = ifelse(daysgap(datadate,3)==3,lag(prccd,3),NA),
+         pxchg1 = (stockpx_lag1-stockpx_lag2)/stockpx_lag2,
+         pxchg2 = (stockpx_lag2-stockpx_lag3)/stockpx_lag3) %>% ungroup()
+names(df_stockpx)[names(df_stockpx) == "prccd"] <- "stockpx"
+df_master <- left_join(df_master, df_stockpx[,c("gvkey","date","stockpx",
+                                                "stockpx_lag1","stockpx_lag2","stockpx_lag3",
+                                                "pxchg1","pxchg2")], by=c("gvkey","date")) %>% 
+  group_by(gvkey) %>% fill(stockpx, stockpx_lag1, stockpx_lag2, stockpx_lag3,pxchg1 ,pxchg2)
+#Get Tweets Text Sentiment
+tweets_sen <- df_tweets[,c("gvkey","created_at","text")]
+tweets_sen$date <- as.Date(tweets_sen$created_at)
+#first assign linenumber to each tweet and count the numbers of words in each tweet
+#performing tokenization
+tweets_sen <- tweets_sen %>% 
+  mutate(linenumber=row_number(),
+         word_count = lengths(gregexpr("\\W+", text)) + 1) %>%
+  group_by(gvkey,date) %>%
+  unnest_tokens(word,text) %>%
+  ungroup()
+#drop the stop words and join with lexicon afinn
+#sen is the sentiment score for each tweet 
+#avg_sen is sen divided by the number of words that can be linked to the afinn.
+#word_sen is sen divided by the number of words in each tweet.
+tweets_sen <- tweets_sen %>% anti_join(stop_words,by = "word") %>%
+  inner_join(get_sentiments("afinn"),by = "word") %>% 
+  group_by(gvkey,date,linenumber) %>%
+  mutate(sen=sum(value)) %>%
+  ungroup() %>%
+  count(gvkey, date, linenumber, sen, word_count) %>%
+  mutate(avg_sen=sen/n) %>%
+  mutate(word_sen=sen/word_count)
+tweets_ex <- df_tweets[,c("gvkey","created_at" ,"favorite_count","retweet_count","media_type","hashtags")]
+tweets_ex$date <- as.Date(tweets_ex$created_at)
+tweets_ex <- left_join(tweets_ex, tweets_sen, by=c("gvkey","date"))
+#no_of_tweets: the number of tweets made by each Twitter account per day
+#max_fav_count: the maximum favourite counts for each Twitter account per day 
+#sum_fav_count: the sum of favourite counts for each Twitter account per day 
+#similar to max_retweet_count and sum_retweet_count
+#isphoto:the number of tweets that includes photo for each Twitter account per day 
+#similar to ishashtage
+tweets_ex <- tweets_ex %>% mutate(photo = ifelse(media_type %in% c("photo","photo|photo"),1,0)) %>%
+  group_by(gvkey,date) %>% 
+  mutate(no_of_tweets = n(),
+         no_of_words=sum(word_count),
+         max_fav_count = max(favorite_count),
+         sum_fav_count=sum(favorite_count),
+         max_retweet_count = max(retweet_count),
+         sum_retweet_count=sum(retweet_count),
+         isphoto = sum(photo),
+         hashtag = ifelse((hashtags==""),0,1),
+         ishashtag = sum(hashtag),
+         dailymean_afinn_sen = mean(avg_sen), #na.rm=True
+         dailymean_word_sen = mean(word_sen)) %>% 
+  dplyr::slice(1) %>% ungroup()
+#Combining the sentiments data with the master data set
+df_master<-left_join(df_master,tweets_ex[,c("gvkey","date","no_of_tweets","no_of_words", "max_fav_count","sum_fav_count","max_retweet_count","sum_retweet_count","isphoto","hashtag","ishashtag","dailymean_afinn_sen", "dailymean_word_sen")],by=c("gvkey","date"))
+#Dropping non_financial columns
+drop <- c("follower_trainavgchgmean",	"followers_chg", "followers_chgabsdaily",	"followers_chgptcdaily",	"followers_fixmean",	"followers_lag1",	"followers_lag2",	"followers_lag3",	"followers_lag4",	"followers_lag5",	"followers_lag6",	"followers_lag7",	"twitter_acc_1",	"twitter_url_1", "dateq", "dldte", "spcsrc", "gics_subind_des", "fyr", "fyear","hashtag")
+df_master= df_master[,!(names(df_master) %in% drop)]
+#Find the columns that contain NA values and list down their names
+list_na <- colnames(df_master)[ apply(df_master, 2, anyNA) ]
+list_na
+#Calculating the column averages to replace the NA values
+average_missing <- apply(df_master[,colnames(df_master) %in% list_na], 2, mean, na.rm =  TRUE)
+average_missing
+#Replacing the NA values in each column with the particular column's mean
+df_master_replace <- df_master %>%
+   mutate(pm_cleaned = ifelse(is.na(pm), average_missing[2], pm),
+          pm_lag_cleaned = ifelse(is.na(pm_lag), average_missing[3], pm_lag),
+          aturn_cleaned = ifelse(is.na(aturn), average_missing[4], aturn),
+          aturn_lag_cleaned = ifelse(is.na(aturn_lag), average_missing[5], aturn_lag),
+          roc_cleaned = ifelse(is.na(roc), average_missing[6], roc),
+          roc_lag_cleaned = ifelse(is.na(roc_lag), average_missing[7], roc_lag),
+          gpa_cleaned = ifelse(is.na(gpa), average_missing[8], gpa),
+          gpa_lag_cleaned = ifelse(is.na(gpa_lag), average_missing[9], gpa_lag),
+          lev_cleaned = ifelse(is.na(lev), average_missing[10], lev),
+          lev_lag_cleaned = ifelse(is.na(lev_lag), average_missing[11], lev_lag),
+          eyield_cleaned = ifelse(is.na(eyield), average_missing[12], eyield),
+          eyield_lag_cleaned = ifelse(is.na(eyield_lag), average_missing[13], eyield_lag),
+          divpo_cleaned = ifelse(is.na(divpo), average_missing[14], divpo),
+          divpo_lag_cleaned = ifelse(is.na(divpo_lag), average_missing[15], divpo_lag),
+          bm_cleaned = ifelse(is.na(bm), average_missing[16], bm),
+          bm_lag_cleaned = ifelse(is.na(bm_lag), average_missing[17], bm_lag),
+          revt_cleaned = ifelse(is.na(revt), average_missing[18], revt),
+          revt_lag_cleaned = ifelse(is.na(revt_lag), average_missing[19], revt_lag),
+          revt_growth_cleaned = ifelse(is.na(revt_growth), average_missing[20], revt_growth),
+          optdr_lag_cleaned = ifelse(is.na(optdr_lag), average_missing[21], optdr_lag),
+          dlrsn_cleaned = ifelse(is.na(dlrsn), average_missing[22], dlrsn),
+          auop_cleaned = ifelse(is.na(auop), average_missing[23], auop),
+          auop_lag_cleaned = ifelse(is.na(auop_lag), average_missing[24], auop_lag),
+          pmq_cleaned = ifelse(is.na(pmq), average_missing[25], pmq),
+          pmq_lag1_cleaned = ifelse(is.na(pmq_lag1), average_missing[26], pmq_lag1),
+          pmq_lag2_cleaned = ifelse(is.na(pmq_lag2), average_missing[27], pmq_lag2),
+          pmq_lag3_cleaned = ifelse(is.na(pmq_lag3), average_missing[28], pmq_lag3),
+          pmq_lag4_cleaned = ifelse(is.na(pmq_lag4), average_missing[29], pmq_lag4),
+          aturnq_cleaned = ifelse(is.na(aturnq), average_missing[30], aturnq),
+          aturnq_lag1_cleaned = ifelse(is.na(aturnq_lag1), average_missing[31], aturnq_lag1),
+          aturnq_lag2_cleaned = ifelse(is.na(aturnq_lag2), average_missing[32], aturnq_lag2),
+          aturnq_lag3_cleaned = ifelse(is.na(aturnq_lag3), average_missing[33], aturnq_lag3),
+          aturnq_lag4_cleaned = ifelse(is.na(aturnq_lag4), average_missing[34], aturnq_lag4),
+          rocq_cleaned = ifelse(is.na(rocq), average_missing[35], rocq),
+          rocq_lag1_cleaned = ifelse(is.na(rocq_lag1), average_missing[36], rocq_lag1),
+          rocq_lag2_cleaned = ifelse(is.na(rocq_lag2), average_missing[37], rocq_lag2),
+          rocq_lag3_cleaned = ifelse(is.na(rocq_lag3), average_missing[38], rocq_lag3),
+          rocq_lag4_cleaned = ifelse(is.na(rocq_lag4), average_missing[39], rocq_lag4),
+          gpaq_cleaned = ifelse(is.na(gpaq), average_missing[40], gpaq),
+          gpaq_lag1_cleaned = ifelse(is.na(gpaq_lag1), average_missing[41], gpaq_lag1),
+          gpaq_lag2_cleaned = ifelse(is.na(gpaq_lag2), average_missing[42], gpaq_lag2),
+          gpaq_lag3_cleaned = ifelse(is.na(gpaq_lag3), average_missing[43], gpaq_lag3),
+          gpaq_lag4_cleaned = ifelse(is.na(gpaq_lag4), average_missing[44], gpaq_lag4),
+          levq_cleaned = ifelse(is.na(levq), average_missing[45], levq),
+          levq_lag1_cleaned = ifelse(is.na(levq_lag1), average_missing[46], levq_lag1),
+          levq_lag2_cleaned = ifelse(is.na(levq_lag2), average_missing[47], levq_lag2),
+          levq_lag3_cleaned = ifelse(is.na(levq_lag3), average_missing[48], levq_lag3),
+          levq_lag4_cleaned = ifelse(is.na(levq_lag4), average_missing[49], levq_lag4),
+          eyieldq_cleaned = ifelse(is.na(eyieldq), average_missing[50], eyieldq),
+          eyieldq_lag1_cleaned = ifelse(is.na(eyieldq_lag1), average_missing[51], eyieldq_lag1),
+          eyieldq_lag2_cleaned = ifelse(is.na(eyieldq_lag2), average_missing[52], eyieldq_lag2),
+          eyieldq_lag3_cleaned = ifelse(is.na(eyieldq_lag3), average_missing[53], eyieldq_lag3),
+          eyieldq_lag4_cleaned = ifelse(is.na(eyieldq_lag4), average_missing[54], eyieldq_lag4),
+          divpoq_cleaned = ifelse(is.na(divpoq), average_missing[55], divpoq),
+          divpoq_lag1_cleaned = ifelse(is.na(divpoq_lag1), average_missing[56], divpoq_lag1),
+          divpoq_lag2_cleaned = ifelse(is.na(divpoq_lag2), average_missing[57], divpoq_lag2),
+          divpoq_lag3_cleaned = ifelse(is.na(divpoq_lag3), average_missing[58], divpoq_lag3),
+          divpoq_lag4_cleaned = ifelse(is.na(divpoq_lag4), average_missing[59], divpoq_lag4),
+          bmq_cleaned = ifelse(is.na(bmq), average_missing[60], bmq),
+          bmq_lag1_cleaned = ifelse(is.na(bmq_lag1), average_missing[61], bmq_lag1),
+          bmq_lag2_cleaned = ifelse(is.na(bmq_lag2), average_missing[62], bmq_lag2),
+          bmq_lag3_cleaned = ifelse(is.na(bmq_lag3), average_missing[63], bmq_lag3),
+          bmq_lag4_cleaned = ifelse(is.na(bmq_lag4), average_missing[64], bmq_lag4),
+          revtq_cleaned = ifelse(is.na(revtq), average_missing[65], revtq),
+          revtq_lag1_cleaned = ifelse(is.na(revtq_lag1), average_missing[66], revtq_lag1),
+          revtq_lag2_cleaned = ifelse(is.na(revtq_lag2), average_missing[67], revtq_lag2),
+          revtq_lag3_cleaned = ifelse(is.na(revtq_lag3), average_missing[68], revtq_lag3),
+          revtq_lag4_cleaned = ifelse(is.na(revtq_lag4), average_missing[69], revtq_lag4),
+          revtq_growth1_cleaned = ifelse(is.na(revtq_growth1), average_missing[70], revtq_growth1),
+          revtq_growth2_cleaned = ifelse(is.na(revtq_growth2), average_missing[71], revtq_growth2),
+          revtq_growth3_cleaned = ifelse(is.na(revtq_growth3), average_missing[72], revtq_growth3),
+          revtq_growth4_cleaned = ifelse(is.na(revtq_growth4), average_missing[73], revtq_growth4),
+          optdrq_lag1_cleaned = ifelse(is.na(optdrq_lag1), average_missing[74], optdrq_lag1),
+          optdrq_lag2_cleaned = ifelse(is.na(optdrq_lag2), average_missing[75], optdrq_lag2),
+          optdrq_lag3_cleaned = ifelse(is.na(optdrq_lag3), average_missing[76], optdrq_lag3),
+          optdrq_lag4_cleaned = ifelse(is.na(optdrq_lag4), average_missing[77], optdrq_lag4),
+          stockpx_cleaned = ifelse(is.na(stockpx), average_missing[78], stockpx),
+          stockpx_lag1_cleaned = ifelse(is.na(stockpx_lag1), average_missing[79], stockpx_lag1),
+          stockpx_lag2_cleaned = ifelse(is.na(stockpx_lag2), average_missing[80], stockpx_lag2),
+          stockpx_lag3_cleaned = ifelse(is.na(stockpx_lag3), average_missing[81], stockpx_lag3),
+          pxchg1_cleaned = ifelse(is.na(pxchg1), average_missing[82], pxchg1),
+          pxchg2_cleaned = ifelse(is.na(pxchg2), average_missing[83], pxchg2),
+          no_of_tweets_cleaned = ifelse(is.na(no_of_tweets), average_missing[84], no_of_tweets),
+          no_of_words_cleaned = ifelse(is.na(no_of_words), average_missing[85], no_of_words),
+          max_fav_count_cleaned = ifelse(is.na(max_fav_count), average_missing[86], max_fav_count),
+          sum_fav_count_cleaned = ifelse(is.na(sum_fav_count), average_missing[87], sum_fav_count),
+          max_retweet_count_cleaned = ifelse(is.na(max_retweet_count), average_missing[88], max_retweet_count),
+          sum_retweet_count_cleaned = ifelse(is.na(sum_retweet_count), average_missing[89], sum_retweet_count),
+          isphoto_cleaned = ifelse(is.na(isphoto), average_missing[90], isphoto),
+          ishashtag_cleaned = ifelse(is.na(ishashtag), average_missing[91], ishashtag),
+          dailymean_afinn_sen_cleaned = ifelse(is.na(dailymean_afinn_sen), average_missing[92], dailymean_afinn_sen),
+          dailymean_word_sen_cleaned = ifelse(is.na(dailymean_word_sen), average_missing[93], dailymean_word_sen))
+#Dropping the older columns with NA values & keeping only the non-NA columns
+drop1 <- c("pm", "pm_lag", "aturn", "aturn_lag", "roc", "roc_lag", "gpa", "gpa_lag", "lev", "lev_lag", "eyield", "eyield_lag", "divpo", "divpo_lag", "bm", "bm_lag", "revt", "revt_lag", "revt_growth", "optdr_lag", "dlrsn", "auop", "auop_lag", "pmq", "pmq_lag1", "pmq_lag2", "pmq_lag3", "pmq_lag4", "aturnq", "aturnq_lag1", "aturnq_lag2", "aturnq_lag3", "aturnq_lag4", "rocq", "rocq_lag1", "rocq_lag2", "rocq_lag3", "rocq_lag4", "gpaq", "gpaq_lag1", "gpaq_lag2", "gpaq_lag3", "gpaq_lag4", "levq", "levq_lag1", "levq_lag2", "levq_lag3", "levq_lag4", "eyieldq", "eyieldq_lag1", "eyieldq_lag2", "eyieldq_lag3", "eyieldq_lag4", "divpoq", "divpoq_lag1", "divpoq_lag2", "divpoq_lag3", "divpoq_lag4", "bmq", "bmq_lag1", "bmq_lag2", "bmq_lag3", "bmq_lag4", "revtq", "revtq_lag1", "revtq_lag2", "revtq_lag3", "revtq_lag4", "revtq_growth1", "revtq_growth2", "revtq_growth3", "revtq_growth4", "optdrq_lag1", "optdrq_lag2", "optdrq_lag3", "optdrq_lag4", "stockpx", "stockpx_lag1", "stockpx_lag2", "stockpx_lag3", "pxchg1", "pxchg2", "no_of_tweets", "no_of_words", "max_fav_count", "sum_fav_count", "max_retweet_count", "sum_retweet_count", "isphoto", "ishashtag", "dailymean_afinn_sen", "dailymean_word_sen")
+df_master_replace = df_master_replace[,!(names(df_master_replace) %in% drop1)]
+#Replacing the older training dataframe with the cleaned dataframe
+df_master <- df_master_replace
+#Splitting the master data-set into training & testing datasets
+df_master_train<-df_master %>%
+  filter(month(date)<7)
+df_master_test<-df_master %>%
+  filter(month(date)>=7)
+# Save financial/accounting data into masterdata csv (train and test)
+#defined names of data
+f <- paste0("Data_Files/2processed/masterdata.csv")
+f1 <- paste0("Data_Files/2processed/masterdata_train.csv")
+f2 <- paste0("Data_Files/2processed/masterdata_test.csv")
+# Write csv for full dataset
+if (file.exists(f)) {
+  cat("\n", f, "already created")
+} else {
+  write.csv(df_master, f, row.names = FALSE)
+  cat("\nNew",f,"created")
+}
+# Write training dataset
+if (file.exists(f1)) {
+  cat("\n", f1, "already created")
+} else {
+  write.csv(df_master_train, f1, row.names = FALSE)
+  cat("\nNew",f1,"created")
+}
+# Write testing dataset
+if (file.exists(f2)) {
+  cat("\n", f2, "already created")
+} else {
+  write.csv(df_master_test, f2, row.names = FALSE)
+  cat("\nNew",f2,"created")
+}
+```
+
+# Report section 3.4 - Calculating Tweet Sentiment Scores
+
+**Note on sentiment scores preparation**<br/>
+The sentiment scores are obtain on a word by word basis using the AFINN method, where each word is given a score from -5 to 5. However, the various companies will tweet at different rates with different number of characters in each tweet. To aggregate the scores without biasing companies who tweet multiple times per day and/or long tweets.<br/>
+
+We use the following formula to aggregate score of all tweets from a company for any given day:<br/>
+
+Where:<br/>
+$x_{n}$ = sentiment of n^th tweet of the day <br/>
+$y_{n}$ = number of words in n^th tweet of the day <br/>
+$z_{n}$ = score of n^th tweet of the day ($\frac{x_{n}}{y_{n}}$) <br/>
+${\sum_{n=1}^{n}}{z_{n}}$ = sum of all <br/>
+$\frac{\sum_{n = 1}^{n} z_{n}}{n}$ = Average sentiment of the day <br/>
+
+**Assumption on treatment for missing Followers count**<br/>
+The training dataset contains missing followers count data for certain dates, which will result in gaps when using Timeseries models. To solve the issue, missing followers count is interpolated from the last available to the next available followers count data. When the missing followers count is experienced in the beginning of the timeseries, the next available followers count is being used to backward patch the NA values. The above will ensure there is followers count data for everyday in the training data set from 1 Jan 2017 to 30 Jun 2017.<br/>
+
+**Assumption on treatment for missing stock price**<br/>
+For missing stock price information (such as weekends, or stock trading suspension), the last available stock price is forward patched to the NA values.<br/>
+```{r readfiles, echo=FALSE, warning=FALSE}
+df_master_train <- read.csv("Data_Files/2processed/masterdata_train.csv",stringsAsFactors = FALSE)
+df_master_test <- read.csv("Data_Files/2processed/masterdata_test.csv",stringsAsFactors = FALSE)
+```
+
+# Report Section 4.1 - OLS Regression
+
+## Model 4.1.1 - OLS MODEL 1: Regressing the followers number on the tweets variables
+```{r Model 1 - OLS, echo=FALSE, warning=FALSE}
+model411<-lm(followers ~ no_of_tweets_cleaned + no_of_words_cleaned + max_fav_count_cleaned + 
+    sum_fav_count_cleaned + max_retweet_count_cleaned + sum_retweet_count_cleaned + isphoto_cleaned + 
+    ishashtag_cleaned + dailymean_afinn_sen_cleaned + dailymean_word_sen_cleaned, data = df_master_train)
+summary(model411)
+#predict on the training set and test set
+df_master_train$followers_predict411<-predict(model411,df_master_train)
+df_master_test$followers <- predict(model411, df_master_test)
+summary(df_master_test$followers)
+#get the first number of followers for each company in the training set
+#followers_on_Jan01 is the number of followers of each company on the first day in the training set
+df_master_train_first<-df_master_train%>%
+  group_by(gvkey)%>%
+  arrange(gvkey,date)%>%
+  dplyr::slice(1)
+df_master_train<-df_master_train%>%
+  left_join(df_master_train_first[,c("gvkey","followers")],by=c("gvkey"))
+            
+colnames(df_master_train)[colnames(df_master_train) == "followers.x"] <- "followers"
+colnames(df_master_train)[colnames(df_master_train) == "followers.y"] <- "followers_on_Jan01"
+df_master_train$followers_predict411<-ifelse(df_master_train$followers_predict411<df_master_train$followers_on_Jan01,df_master_train$followers_on_Jan01,df_master_train$followers_predict411)
+cat("MAE for Model411 is",mae(df_master_train$followers,df_master_train$followers_predict411))
+#get the last number of followers for each company in the training set
+#followers_on_Jun30 is the number of followers of each company on the last day in the training set
+df_master_train_last<-df_master_train%>%
+  group_by(gvkey)%>%
+  arrange(gvkey,desc(date))%>%
+  dplyr::slice(1)
+df_master_test<-df_master_test%>%
+  left_join(df_master_train_last[,c("gvkey","followers")],by=c("gvkey"))
+colnames(df_master_test)[colnames(df_master_test) == "followers.x"] <- "followers"
+colnames(df_master_test)[colnames(df_master_test) == "followers.y"] <- "followers_on_Jun30"
+#replace NA with followers_on_Jun30
+df_master_test$followers<-ifelse(is.na(df_master_test$followers),df_master_test$followers_on_Jun30,df_master_test$followers)
+#if the predicted followers is lower than followers_on_Jun30, replace it with followers_on_Jun30
+df_master_test$followers<-ifelse(df_master_test$followers<df_master_test$followers_on_Jun30,df_master_test$followers_on_Jun30,df_master_test$followers)
+# Write testing dataset
+kaggleoutput("submissionfile411.csv",df_master_test)
+```
+
+## Model 4.1.2 - OLS MODEL 2: Regressing the followers change on the tweets variables
+```{r Model 2 OLS, echo=FALSE, warning=FALSE}
+# Create followers_chg variable for Model 2
+df_master_train <- df_master_train%>% 
+  arrange(gvkey, date) %>%
+  group_by(gvkey) %>% 
+  mutate(followers_chg = ifelse(is.na(lag(followers)|lag(followers,2)), NA, lag(followers)-lag(followers,2)))%>%
+           ungroup()
+df_master_test <- df_master_test%>% 
+  arrange(gvkey, date) %>%
+  group_by(gvkey) %>% 
+  mutate(followers_chg = ifelse(is.na(lag(followers)|lag(followers,2)), NA, lag(followers)-lag(followers,2)))%>%
+           ungroup()
+model412<-lm(followers_chg ~ no_of_tweets_cleaned + no_of_words_cleaned + max_fav_count_cleaned + 
+    sum_fav_count_cleaned + max_retweet_count_cleaned + sum_retweet_count_cleaned + isphoto_cleaned + 
+    ishashtag_cleaned + dailymean_afinn_sen_cleaned + dailymean_word_sen_cleaned,data=df_master_train)
+summary(model412)
+```
+
+## Model 4.1.3 - OLS MODEL 3: Regressing the followers number on the tweets variables with fixed effect
+```{r Model 3 OLS fixed effects, echo=FALSE, warning=FALSE}
+# Uses lfe library
+df_master_train$gvkey <- factor(df_master_train$gvkey)
+model413<-felm(followers ~ no_of_tweets_cleaned + no_of_words_cleaned + max_fav_count_cleaned + sum_fav_count_cleaned + max_retweet_count_cleaned + sum_retweet_count_cleaned + isphoto_cleaned + ishashtag_cleaned + dailymean_afinn_sen_cleaned + dailymean_word_sen_cleaned|gvkey,data=df_master_train)
+summary(model413)
+#predict on the train set
+df_master_train$followers_predict413 <- predict(model413, df_master_train)
+df_master_train$followers_predict413<-ifelse(is.na(df_master_train$followers_predict413),df_master_train$followers_on_Jan01,df_master_train$followers_predict413)
+df_master_train$followers_predict413<-ifelse(df_master_train$followers_predict413<df_master_train$followers_on_Jan01,df_master_train$followers_on_Jan01,df_master_train$followers_predict413)
+cat("MAE for Model413 is",mae(df_master_train$followers,df_master_train$followers_predict413))
+#predict on the test set
+df_master_test$followers <- NA
+df_master_test$followers <- predict(model413, df_master_test)
+summary(df_master_test$followers)
+#replace NA with followers_on_Jun30
+df_master_test$followers<-ifelse(is.na(df_master_test$followers),df_master_test$followers_on_Jun30,df_master_test$followers)
+#if the predicted followers is lower than followers_on_Jun30, replace it with followers_on_Jun30
+df_master_test$followers<-ifelse(df_master_test$followers<df_master_test$followers_on_Jun30,df_master_test$followers_on_Jun30,df_master_test$followers)
+summary(df_master_test$followers)
+# Write testing dataset
+kaggleoutput("submissionfile413.csv",df_master_test)
+```
+
+## Model 4.1.4 - OLS MODEL 4: Best Subset Selection on the tweets variables
+```{r Model 4 OLS Bestsubset, echo=FALSE, warning=FALSE}
+#regsubset
+library(leaps)
+regfit414.all <-regsubsets(followers~no_of_tweets_cleaned + no_of_words_cleaned + max_fav_count_cleaned + 
+    sum_fav_count_cleaned + max_retweet_count_cleaned + sum_retweet_count_cleaned+isphoto_cleaned + 
+    ishashtag_cleaned + dailymean_afinn_sen_cleaned + dailymean_word_sen_cleaned,data=df_master_train)
+reg414.summary <- summary(regfit414.all)
+plot(reg414.summary$adjr2, main="Adjusted r^2 plot", 
+     xlab="Number of variables", ylab="Adjusted r^2", type="b")
+plot(reg414.summary$bic, main="BIC plot", 
+     xlab="Number of variables", ylab="BIC", type="b")
+a <- which.max(reg414.summary$adjr2)
+b <- which.min(reg414.summary$bic)
+coef(regfit414.all, a)
+coef(regfit414.all, b)
+```
+```{r, echo=FALSE, warning=FALSE}
+model414<-felm(followers~  max_fav_count_cleaned+sum_fav_count_cleaned|gvkey,data=df_master_train)
+summary(model414)
+#predict on the train set
+df_master_train$followers_predict414 <- predict(model414, df_master_train)
+df_master_train$followers_predict414<-ifelse(is.na(df_master_train$followers_predict414),df_master_train$followers_on_Jan01,df_master_train$followers_predict414)
+df_master_train$followers_predict414<-ifelse(df_master_train$followers_predict414<df_master_train$followers_on_Jan01,df_master_train$followers_on_Jan01,df_master_train$followers_predict414)
+cat("MAE for Model414 is",mae(df_master_train$followers,df_master_train$followers_predict414))
+#predict on the test set 
+df_master_test$followers <- NA
+df_master_test$followers <- predict(model414, df_master_test)
+summary(df_master_test$followers)
+#replace NA with followers_on_Jun30
+df_master_test$followers<-ifelse(is.na(df_master_test$followers),df_master_test$followers_on_Jun30,df_master_test$followers)
+#if the predicted followers is lower than followers_on_Jun30, replace it with followers_on_Jun30
+df_master_test$followers<-ifelse(df_master_test$followers < df_master_test$followers_on_Jun30,df_master_test$followers_on_Jun30,df_master_test$followers)
+# Write testing dataset
+kaggleoutput("submissionfile414.csv",df_master_test)
+```
+
+
+
+## Model 4.1.5 - OLS MODEL 5: Regressing the followers number on the financial information
+```{r Model 5, echo=FALSE, warning=FALSE}
+#Model 5 - OLS model regressing the followers count against the financial information
+model415 <- lm (followers ~ pm_cleaned + aturn_cleaned + roc_cleaned + gpa_cleaned + lev_cleaned + eyield_cleaned + divpo_cleaned + bm_cleaned + revt_cleaned + revt_growth_cleaned + dlrsn_cleaned + auop_cleaned + pmq_cleaned + aturnq_cleaned + rocq_cleaned + gpaq_cleaned + levq_cleaned + eyieldq_cleaned + divpoq_cleaned + bmq_cleaned + revtq_cleaned + stockpx_cleaned + pxchg1_cleaned + pxchg2_cleaned, data = df_master_train)
+summary (model415)
+#Predicting the number of followers based on Model 5
+df_master_test$followers <- NA
+df_master_test$followers <- predict(model415, df_master_test)
+summary(df_master_test$followers)
+#replace NA with followers_on_Jun30
+df_master_test$followers<-ifelse(is.na(df_master_test$followers),df_master_test$followers_on_Jun30,df_master_test$followers)
+#if the predicted followers is lower than followers_on_Jun30, replace it with followers_on_Jun30
+df_master_test$followers <- ifelse(df_master_test$followers < df_master_test$followers_on_Jun30,df_master_test$followers_on_Jun30,df_master_test$followers)
+# Write testing dataset
+kaggleoutput("submission415.csv",df_master_test)
+#Kaggle Score - 96443.89351
+```
+
+## Model 4.1.6 - OLS MODEL 6: Regressing the followers number on the financial variables & their respective lags & leads
+```{r Model 6, echo=FALSE, warning=FALSE}
+#Model 6 - OLS model regressing the followers count against the financial variables & their respective lags & leads
+model416 <- lm (followers ~ pm_cleaned + pm_lag_cleaned + aturn_cleaned + aturn_lag_cleaned + roc_cleaned + roc_lag_cleaned + gpa_cleaned + gpa_lag_cleaned + lev_cleaned + lev_lag_cleaned + eyield_cleaned + eyield_lag_cleaned + divpo_cleaned + divpo_lag_cleaned + bm_cleaned + bm_lag_cleaned + revt_cleaned + revt_lag_cleaned + revt_growth_cleaned + optdr_lag_cleaned + dlrsn_cleaned + auop_cleaned + auop_lag_cleaned + pmq_cleaned + pmq_lag1_cleaned + pmq_lag2_cleaned + pmq_lag3_cleaned + pmq_lag4_cleaned + aturnq_cleaned + aturnq_lag1_cleaned + aturnq_lag2_cleaned + aturnq_lag3_cleaned + aturnq_lag4_cleaned + rocq_cleaned + rocq_lag1_cleaned + rocq_lag2_cleaned + rocq_lag3_cleaned + rocq_lag4_cleaned + gpaq_cleaned + gpaq_lag1_cleaned + gpaq_lag2_cleaned + gpaq_lag3_cleaned + gpaq_lag4_cleaned + levq_cleaned + levq_lag1_cleaned + levq_lag2_cleaned + levq_lag3_cleaned + levq_lag4_cleaned + eyieldq_cleaned + eyieldq_lag1_cleaned + eyieldq_lag2_cleaned + eyieldq_lag3_cleaned + eyieldq_lag4_cleaned + divpoq_cleaned + divpoq_lag1_cleaned + divpoq_lag2_cleaned + divpoq_lag3_cleaned + divpoq_lag4_cleaned + bmq_cleaned + bmq_lag1_cleaned + bmq_lag2_cleaned + bmq_lag3_cleaned + bmq_lag4_cleaned + revtq_cleaned + revtq_lag1_cleaned + revtq_lag2_cleaned + revtq_lag3_cleaned + revtq_lag4_cleaned + revtq_growth1_cleaned + revtq_growth2_cleaned + revtq_growth3_cleaned + revtq_growth4_cleaned + optdrq_lag1_cleaned + optdrq_lag2_cleaned + optdrq_lag3_cleaned + optdrq_lag4_cleaned + stockpx_cleaned + stockpx_lag1_cleaned + stockpx_lag2_cleaned + stockpx_lag3_cleaned + pxchg1_cleaned + pxchg2_cleaned, data = df_master_train)
+summary (model416)
+#Predicting the number of followers based on Model 6
+df_master_test$followers <- NA
+df_master_test$followers <- predict(model416, df_master_test)
+summary(df_master_test$followers)
+#replace NA with followers_on_Jun30
+df_master_test$followers<-ifelse(is.na(df_master_test$followers),df_master_test$followers_on_Jun30,df_master_test$followers)
+#if the predicted followers is lower than followers_on_Jun30, replace it with followers_on_Jun30
+df_master_test$followers<-ifelse(df_master_test$followers < df_master_test$followers_on_Jun30,df_master_test$followers_on_Jun30,df_master_test$followers)
+# Write testing dataset
+kaggleoutput("submission416.csv",df_master_test)
+#Kaggle score = 171975.01681
+```
+
+## Model 4.1.7 - OLS MODEL 7: Regressing the followers number on the financial variables with fixed effect
+```{r Model 7, echo=FALSE, warning=FALSE}
+#Model 7 - Fixed effect regression to control difference of averages between the companies, using only financial information
+model417 <- felm (followers ~ pm_cleaned + aturn_cleaned + roc_cleaned + gpa_cleaned + lev_cleaned + eyield_cleaned + divpo_cleaned + bm_cleaned + revt_cleaned + revt_growth_cleaned + dlrsn_cleaned + auop_cleaned + pmq_cleaned + aturnq_cleaned + rocq_cleaned + gpaq_cleaned + levq_cleaned + eyieldq_cleaned + divpoq_cleaned + bmq_cleaned + revtq_cleaned + stockpx_cleaned + pxchg1_cleaned + pxchg2_cleaned|gvkey, data = df_master_train)
+summary (model417)
+#Predicting the number of followers based on Model 7
+df_master_test$followers <- NA
+df_master_test$followers <- predict(model417, df_master_test)
+summary(df_master_test$followers)
+#replace NA with followers_on_Jun30
+df_master_test$followers<-ifelse(is.na(df_master_test$followers),df_master_test$followers_on_Jun30,df_master_test$followers)
+#if the predicted followers is lower than followers_on_Jun30, replace it with followers_on_Jun30
+df_master_test$followers<-ifelse(df_master_test$followers < df_master_test$followers_on_Jun30,df_master_test$followers_on_Jun30,df_master_test$followers)
+# Write testing dataset
+kaggleoutput("submission417.csv",df_master_test)
+#Kaggle Score - 2703.97552
+```
+
+## Model 4.1.8 - OLS MODEL 8: Regressing the followers number on the financial information and sentiment data
+```{r Model 8, echo=FALSE, warning=FALSE}
+#Model 8 - OLS model regressing the followers count against the financial information + sentiment data
+model418 <- lm (followers ~ pm_cleaned + aturn_cleaned + roc_cleaned + gpa_cleaned + lev_cleaned + eyield_cleaned + divpo_cleaned + bm_cleaned + revt_cleaned + revt_growth_cleaned + dlrsn_cleaned + auop_cleaned + pmq_cleaned + aturnq_cleaned + rocq_cleaned + gpaq_cleaned + levq_cleaned + eyieldq_cleaned + divpoq_cleaned + bmq_cleaned + revtq_cleaned + stockpx_cleaned + pxchg1_cleaned + pxchg2_cleaned + dailymean_afinn_sen_cleaned + dailymean_word_sen_cleaned, data = df_master_train)
+summary (model418)
+#Predicting the number of followers based on Model 8
+df_master_test$followers <- NA
+df_master_test$followers <- predict(model418, df_master_test)
+summary(df_master_test$followers)
+#replace NA with followers_on_Jun30
+df_master_test$followers<-ifelse(is.na(df_master_test$followers),df_master_test$followers_on_Jun30,df_master_test$followers)
+#if the predicted followers is lower than followers_on_Jun30, replace it with followers_on_Jun30
+df_master_test$followers<-ifelse(df_master_test$followers < df_master_test$followers_on_Jun30,df_master_test$followers_on_Jun30,df_master_test$followers)
+kaggleoutput("submission418.csv",df_master_test)
+#Kaggle Score - 96648.27185
+```
+
+## Model 4.1.9 - OLS MODEL 9: Regressing the followers number on the financial variables, their respective lags & leads and the sentiment data
+```{r Model 9, echo=FALSE, warning=FALSE}
+#Model 9 - OLS model regressing the followers count against the financial variables, their respective lags & leads and the sentiment data
+model419 <- lm (followers ~ pm_cleaned + pm_lag_cleaned + aturn_cleaned + aturn_lag_cleaned + roc_cleaned + roc_lag_cleaned + gpa_cleaned + gpa_lag_cleaned + lev_cleaned + lev_lag_cleaned + eyield_cleaned + eyield_lag_cleaned + divpo_cleaned + divpo_lag_cleaned + bm_cleaned + bm_lag_cleaned + revt_cleaned + revt_lag_cleaned + revt_growth_cleaned + optdr_lag_cleaned + dlrsn_cleaned + auop_cleaned + auop_lag_cleaned + pmq_cleaned + pmq_lag1_cleaned + pmq_lag2_cleaned + pmq_lag3_cleaned + pmq_lag4_cleaned + aturnq_cleaned + aturnq_lag1_cleaned + aturnq_lag2_cleaned + aturnq_lag3_cleaned + aturnq_lag4_cleaned + rocq_cleaned + rocq_lag1_cleaned + rocq_lag2_cleaned + rocq_lag3_cleaned + rocq_lag4_cleaned + gpaq_cleaned + gpaq_lag1_cleaned + gpaq_lag2_cleaned + gpaq_lag3_cleaned + gpaq_lag4_cleaned + levq_cleaned + levq_lag1_cleaned + levq_lag2_cleaned + levq_lag3_cleaned + levq_lag4_cleaned + eyieldq_cleaned + eyieldq_lag1_cleaned + eyieldq_lag2_cleaned + eyieldq_lag3_cleaned + eyieldq_lag4_cleaned + divpoq_cleaned + divpoq_lag1_cleaned + divpoq_lag2_cleaned + divpoq_lag3_cleaned + divpoq_lag4_cleaned + bmq_cleaned + bmq_lag1_cleaned + bmq_lag2_cleaned + bmq_lag3_cleaned + bmq_lag4_cleaned + revtq_cleaned + revtq_lag1_cleaned + revtq_lag2_cleaned + revtq_lag3_cleaned + revtq_lag4_cleaned + revtq_growth1_cleaned + revtq_growth2_cleaned + revtq_growth3_cleaned + revtq_growth4_cleaned + optdrq_lag1_cleaned + optdrq_lag2_cleaned + optdrq_lag3_cleaned + optdrq_lag4_cleaned + stockpx_cleaned + stockpx_lag1_cleaned + stockpx_lag2_cleaned + stockpx_lag3_cleaned + pxchg1_cleaned + pxchg2_cleaned + dailymean_afinn_sen_cleaned + dailymean_word_sen_cleaned, data = df_master_train)
+summary (model419)
+```
+```{r, echo=FALSE, warning=FALSE}
+#Predicting the number of followers based on Model 9
+df_master_test$followers <- NA
+df_master_test$followers <- predict(model419, df_master_test)
+summary(df_master_test$followers)
+#replace NA with followers_on_Jun30
+df_master_test$followers<-ifelse(is.na(df_master_test$followers),df_master_test$followers_on_Jun30,df_master_test$followers)
+#if the predicted followers is lower than followers_on_Jun30, replace it with followers_on_Jun30
+df_master_test$followers<-ifelse(df_master_test$followers < df_master_test$followers_on_Jun30,df_master_test$followers_on_Jun30,df_master_test$followers)
+kaggleoutput("submission419.csv",df_master_test)
+summary(df_master_test$followers)
+#Kaggle Score - 172262.11760
+```
+
+## Model 4.1.10 - OLS MODEL 10: Regressing the followers number on the financial variables and the sentiment data with fixed effect
+```{r Model 10, echo=FALSE, warning=FALSE}
+#Model 10 - Fixed effect regression to control difference of averages between the companies, regressing followers count against financial information and the sentiment data
+library(lfe)
+model4110 <- felm (followers ~ pm_cleaned + aturn_cleaned + roc_cleaned + gpa_cleaned + lev_cleaned + eyield_cleaned + divpo_cleaned + bm_cleaned + revt_cleaned + revt_growth_cleaned + dlrsn_cleaned + auop_cleaned + pmq_cleaned + aturnq_cleaned + rocq_cleaned + gpaq_cleaned + levq_cleaned + eyieldq_cleaned + divpoq_cleaned + bmq_cleaned + revtq_cleaned + stockpx_cleaned + pxchg1_cleaned + pxchg2_cleaned + dailymean_afinn_sen_cleaned + dailymean_word_sen_cleaned|gvkey, data = df_master_train)
+summary (model4110)
+#Predicting the number of followers based on Model 10
+df_master_test$followers <- NA
+df_master_test$followers <- predict(model4110, df_master_test)
+summary(df_master_test$followers)
+#replace NA with followers_on_Jun30
+df_master_test$followers<-ifelse(is.na(df_master_test$followers),df_master_test$followers_on_Jun30,df_master_test$followers)
+#if the predicted followers is lower than followers_on_Jun30, replace it with followers_on_Jun30
+df_master_test$followers<-ifelse(df_master_test$followers < df_master_test$followers_on_Jun30,df_master_test$followers_on_Jun30,df_master_test$followers)
+kaggleoutput("submission4110.csv",df_master_test)
+#Kaggle Score - 2703.97552
+```
+
+## Model 4.1.11 - OLS MODEL 11: Forward Subset Selection on all the available variables
+```{r Model 11, echo=FALSE, warning=FALSE}
+#Model 11 - OLS model using forward subset selection, using all the variables available
+library(leaps)
+model4111_fss <- regsubsets (followers ~ pm_cleaned + pm_lag_cleaned + aturn_cleaned + aturn_lag_cleaned + roc_cleaned + roc_lag_cleaned + gpa_cleaned + gpa_lag_cleaned + lev_cleaned + lev_lag_cleaned + eyield_cleaned + eyield_lag_cleaned + divpo_cleaned + divpo_lag_cleaned + bm_cleaned + bm_lag_cleaned + revt_cleaned + revt_lag_cleaned + revt_growth_cleaned + optdr_lag_cleaned + dlrsn_cleaned + auop_cleaned + auop_lag_cleaned + pmq_cleaned + pmq_lag1_cleaned + pmq_lag2_cleaned + pmq_lag3_cleaned + pmq_lag4_cleaned + aturnq_cleaned + aturnq_lag1_cleaned + aturnq_lag2_cleaned + aturnq_lag3_cleaned + aturnq_lag4_cleaned + rocq_cleaned + rocq_lag1_cleaned + rocq_lag2_cleaned + rocq_lag3_cleaned + rocq_lag4_cleaned + gpaq_cleaned + gpaq_lag1_cleaned + gpaq_lag2_cleaned + gpaq_lag3_cleaned + gpaq_lag4_cleaned + levq_cleaned + levq_lag1_cleaned + levq_lag2_cleaned + levq_lag3_cleaned + levq_lag4_cleaned + eyieldq_cleaned + eyieldq_lag1_cleaned + eyieldq_lag2_cleaned + eyieldq_lag3_cleaned + eyieldq_lag4_cleaned + divpoq_cleaned + divpoq_lag1_cleaned + divpoq_lag2_cleaned + divpoq_lag3_cleaned + divpoq_lag4_cleaned + bmq_cleaned + bmq_lag1_cleaned + bmq_lag2_cleaned + bmq_lag3_cleaned + bmq_lag4_cleaned + revtq_cleaned + revtq_lag1_cleaned + revtq_lag2_cleaned + revtq_lag3_cleaned + revtq_lag4_cleaned + revtq_growth1_cleaned + revtq_growth2_cleaned + revtq_growth3_cleaned + revtq_growth4_cleaned + optdrq_lag1_cleaned + optdrq_lag2_cleaned + optdrq_lag3_cleaned + optdrq_lag4_cleaned + stockpx_cleaned + stockpx_lag1_cleaned + stockpx_lag2_cleaned + stockpx_lag3_cleaned + pxchg1_cleaned + pxchg2_cleaned + dailymean_afinn_sen_cleaned + dailymean_word_sen_cleaned, data = df_master_train, method = "forward")
+model4111_fss_summary <- summary(model4111_fss)
+plot(model4111_fss_summary$adjr2, main="Adjusted r^2 plot", 
+     xlab="Number of variables", ylab="Adjusted r^2", type="b")
+plot(model4111_fss_summary$bic, main="BIC plot", 
+     xlab="Number of variables", ylab="BIC", type="b")
+```
+```{r, echo=FALSE}
+#Building OLS model using the variables chosen by forward subset selection
+#Finding the variables
+a <- which.max(model4111_fss_summary$adjr2)
+b <- which.min(model4111_fss_summary$bic)
+coef(model4111_fss, a)
+coef(model4111_fss, b)
+#Building the OLS model
+model4111_fss_selected <- felm (followers ~  gpa_lag_cleaned + lev_lag_cleaned + revt_cleaned + revt_lag_cleaned + revt_growth_cleaned + optdr_lag_cleaned + gpaq_lag4_cleaned + eyieldq_cleaned + divpoq_cleaned | gvkey, data = df_master_train)
+summary (model4111_fss_selected)
+```
+```{r, echo=FALSE, warning=FALSE}
+#Predicting the number of followers based on Model 11
+df_master_test$followers <- NA
+df_master_test$followers <- predict(model4111_fss_selected, df_master_test)
+summary(df_master_test$followers)
+#replace NA with followers_on_Jun30
+df_master_test$followers<-ifelse(is.na(df_master_test$followers),df_master_test$followers_on_Jun30,df_master_test$followers)
+#if the predicted followers is lower than followers_on_Jun30, replace it with followers_on_Jun30
+df_master_test$followers<-ifelse(df_master_test$followers < df_master_test$followers_on_Jun30,df_master_test$followers_on_Jun30,df_master_test$followers)
+# Create kaggle submission file
+kaggleoutput("submission4111.csv",df_master_test)
+#Kaggle Score - 3425.75409
+```
+
+# Report Section 4.2: LASSO on OLS models
+## Model 4.2.1 - LASSO MODEL 1: Lasso using 100 variables
+```{r Model LASSO1, echo=FALSE, warning=FALSE}
+#Uses glmnet library
+df_master_train$gics_sector_des <- factor(df_master_train$gics_sector_des)
+df_master_test$gics_sector_des <- factor(df_master_test$gics_sector_des)
+Lasso_eq_421 = as.formula("followers~ gics_sector_des + pm_cleaned + pm_lag_cleaned + aturn_cleaned + aturn_lag_cleaned + roc_cleaned + roc_lag_cleaned + gpa_cleaned + gpa_lag_cleaned + lev_cleaned + lev_lag_cleaned + eyield_cleaned + eyield_lag_cleaned + divpo_cleaned + divpo_lag_cleaned + bm_cleaned + bm_lag_cleaned + revt_cleaned + revt_lag_cleaned + revt_growth_cleaned + optdr_lag_cleaned + pmq_cleaned + pmq_lag1_cleaned + pmq_lag2_cleaned + pmq_lag3_cleaned + pmq_lag4_cleaned + aturnq_cleaned + aturnq_lag1_cleaned + aturnq_lag2_cleaned + aturnq_lag3_cleaned + aturnq_lag4_cleaned + rocq_cleaned + rocq_lag1_cleaned + rocq_lag2_cleaned + rocq_lag3_cleaned + rocq_lag4_cleaned + gpaq_cleaned + gpaq_lag1_cleaned + gpaq_lag2_cleaned + gpaq_lag3_cleaned + gpaq_lag4_cleaned + levq_cleaned + levq_lag1_cleaned + levq_lag2_cleaned + levq_lag3_cleaned + levq_lag4_cleaned + eyieldq_cleaned + eyieldq_lag1_cleaned + eyieldq_lag2_cleaned + eyieldq_lag3_cleaned + eyieldq_lag4_cleaned + divpoq_cleaned + divpoq_lag1_cleaned + divpoq_lag2_cleaned + divpoq_lag3_cleaned + divpoq_lag4_cleaned + bmq_cleaned + bmq_lag1_cleaned + bmq_lag2_cleaned + bmq_lag3_cleaned + bmq_lag4_cleaned + revtq_cleaned + revtq_lag1_cleaned + revtq_lag2_cleaned + revtq_lag3_cleaned + revtq_lag4_cleaned + revtq_growth1_cleaned + revtq_growth2_cleaned + revtq_growth3_cleaned + revtq_growth4_cleaned + optdrq_lag1_cleaned + optdrq_lag2_cleaned + optdrq_lag3_cleaned + optdrq_lag4_cleaned + stockpx_cleaned + stockpx_lag1_cleaned + stockpx_lag2_cleaned + stockpx_lag3_cleaned + pxchg1_cleaned + pxchg2_cleaned + no_of_tweets_cleaned + no_of_words_cleaned + max_fav_count_cleaned + 
+    sum_fav_count_cleaned + max_retweet_count_cleaned + sum_retweet_count_cleaned + isphoto_cleaned + 
+    ishashtag_cleaned + dailymean_afinn_sen_cleaned + dailymean_word_sen_cleaned-1 ")
+# Construct matrices for running the LASSO
+options(na.action="na.pass")
+x <- model.matrix(Lasso_eq_421 , data=df_master_train)
+x_test <- model.matrix(Lasso_eq_421, data=df_master_test)
+x_test[is.na(x_test)]<-0
+y <- df_master_train$followers
+#omitting cases with NA values could lead to bias. alternative would be to perform mice.
+```
+
+```{r, echo=FALSE, warning=FALSE}
+set.seed(2020)
+fit421 <- cv.glmnet(y = y,  # Finish this (5 lines)
+                  x = x,
+                  family = "gaussian",
+                  alpha = 1 )
+plot(fit421)
+```
+
+```{r, echo=FALSE, warning=FALSE}
+#Uses coefplot library
+coef(fit421,s="lambda.min")
+coefplot(fit421, lambda='lambda.min', sort='magnitude')
+```
+
+```{r Model LASSO1 predictions, echo=FALSE, warning=FALSE}
+bestlam <- fit421$lambda.min  
+df_master_test$followers <- NA
+df_master_test$followers <- predict(fit421, x_test,s = "lambda.min")
+#replace NA with followers_on_Jun30
+df_master_test$followers<-ifelse(is.na(df_master_test$followers),df_master_test$followers_on_Jun30,df_master_test$followers)
+#if the predicted followers is lower than followers_on_Jun30, replace it with followers_on_Jun30
+df_master_test$followers<-ifelse(df_master_test$followers < df_master_test$followers_on_Jun30,df_master_test$followers_on_Jun30,df_master_test$followers)
+# Write testing dataset
+kaggleoutput("submissionlasso421.csv",df_master_test)
+```
+```{r, echo=FALSE, warning=FALSE}
+coef(fit421,s="lambda.1se")
+coefplot(fit421, lambda='lambda.1se', sort='magnitude')
+```
+
+## Model 4.2.2 - LASSO MODEL 2: Lasso using 43 variables
+```{r Model LASSO2, echo=FALSE, warning=FALSE} 
+#2nd try
+Lasso_eq422 = as.formula("followers~ gics_sector_des + pm_cleaned + aturn_cleaned + roc_cleaned + gpa_cleaned + lev_cleaned + eyield_cleaned + divpo_cleaned + bm_cleaned + revt_cleaned + revt_growth_cleaned + optdr_lag_cleaned + pmq_cleaned + aturnq_cleaned + rocq_cleaned + gpaq_cleaned + levq_cleaned + eyieldq_cleaned + divpoq_cleaned + bmq_cleaned+ revtq_cleaned + stockpx_cleaned + pxchg1_cleaned + no_of_tweets_cleaned + no_of_words_cleaned + max_fav_count_cleaned + 
+    sum_fav_count_cleaned + max_retweet_count_cleaned + sum_retweet_count_cleaned + isphoto_cleaned + 
+    ishashtag_cleaned + dailymean_afinn_sen_cleaned + dailymean_word_sen_cleaned - 1")
+ 
+# Construct matrices for running the LASSO
+x <- model.matrix(Lasso_eq422, data=df_master_train)
+# Construct matrices for running the LASSO
+options(na.action="na.pass")
+x[is.na(x)] <- 0
+x_test <- model.matrix(Lasso_eq422, data=df_master_test)
+x_test[is.na(x_test)]<-0
+y <- df_master_train$followers
+#omitting cases with NA values could lead to bias. alternative would be to perform mice.
+```
+```{r, echo=FALSE, warning=FALSE}
+#
+set.seed(2020)
+#
+fit422 <- cv.glmnet(y = y,  # Finish this (5 lines)
+                  x = x,
+                  family = "gaussian",
+                  alpha = 1 )
+#
+plot(fit422)
+```
+```{r Model LASSO 2 prediction, echo=FALSE,warning=FALSE}
+bestlam <- fit422$lambda.min  
+df_master_test$followers <- NA
+df_master_test$followers <- predict(fit422, x_test,s = "lambda.min")
+#replace NA with followers_on_Jun30
+df_master_test$followers<-ifelse(is.na(df_master_test$followers),df_master_test$followers_on_Jun30,df_master_test$followers)
+#if the predicted followers is lower than followers_on_Jun30, replace it with followers_on_Jun30
+df_master_test$followers<-ifelse(df_master_test$followers < df_master_test$followers_on_Jun30,df_master_test$followers_on_Jun30,df_master_test$followers)
+# Write testing dataset
+kaggleoutput("submissionlasso422.csv",df_master_test)
+```
+```{r, echo=FALSE,warning=FALSE}
+coef(fit422,s="lambda.1se")
+coefplot(fit422, lambda='lambda.1se', sort='magnitude')
+```
+
+
+
+# Report Section 4.3: XGBoost Modelling
+
+```{r, echo=FALSE, warning=FALSE}
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(xgboost))
+suppressPackageStartupMessages(library(devtools))
+suppressPackageStartupMessages(library(caret))
+
+```
+
+```{r Load Data, eval=TRUE, echo=FALSE, warning=FALSE}
+#Modify the Masterdata and do spilttin
+
+df_master <- read.csv("Data_Files/2processed/masterdata.csv", stringsAsFactors=FALSE)
+
+df_master <- df_master %>% group_by(gvkey) %>% mutate(followers_growth = (lag(followers)-lag(followers,2))/lag(followers,2)) %>% ungroup()
+
+df_master <- df_master %>% mutate(day=as.POSIXlt(date)$wday)       #day of week
+df_master$followers_test <- na_locf(df_master$followers)           #dummy for calutation   
+df_master$followers_growth <- na_locf(df_master$followers_growth)  #new col for xgboost
+
+df_master_train<-df_master %>%
+  filter(month(date)<7)
+df_master_test<-df_master %>%
+  filter(month(date)>=7)
+```
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE}
+#Writing eqn for both Training and Testing data
+
+#For Model 4.3.3.3 with PT:
+xgboost_eq4333 = as.formula(followers_growth~ gvkey+day +  pxchg2_cleaned+  no_of_tweets_cleaned + no_of_words_cleaned + max_fav_count_cleaned + sum_fav_count_cleaned + max_retweet_count_cleaned + sum_retweet_count_cleaned   + dailymean_afinn_sen_cleaned + dailymean_word_sen_cleaned)
+
+xgboosttest_eq4333 = as.formula(followers_growth ~ gvkey+day + pxchg2_cleaned+  no_of_tweets_cleaned + no_of_words_cleaned + max_fav_count_cleaned + sum_fav_count_cleaned + max_retweet_count_cleaned + sum_retweet_count_cleaned  + dailymean_afinn_sen_cleaned + dailymean_word_sen_cleaned)
+
+#For Model 4.3.3.2 with PT:
+xgboost_eq4332 = as.formula(followers_growth ~
+                       eyieldq_lag3_cleaned+
+                       pxchg2_cleaned+
+                       eyield_cleaned+
+                       eyieldq_cleaned+
+                       gpaq_lag4_cleaned+
+                       pmq_lag1_cleaned+
+                       eyield_lag_cleaned+
+                       revt_growth_cleaned	+
+                       eyieldq_lag2_cleaned+
+                       pmq_lag4_cleaned
+                       )
+
+
+xgboosttest_eq4332 = as.formula(followers_growth ~
+                       eyieldq_lag3_cleaned+
+                       pxchg2_cleaned+
+                       eyield_cleaned+
+                       eyieldq_cleaned+
+                       gpaq_lag4_cleaned+
+                       pmq_lag1_cleaned+
+                       eyield_lag_cleaned+
+                       revt_growth_cleaned	+
+                       eyieldq_lag2_cleaned+
+                       pmq_lag4_cleaned
+                       )
+
+
+#For Model 4.3.3.1
+xgboost_eq4331 = as.formula(followers_growth ~
+                  gvkey+                      #new
+                  day+                        #new
+                  pm_cleaned+
+                  pm_lag_cleaned+
+                  aturn_cleaned+
+                  aturn_lag_cleaned+
+                  roc_cleaned+
+                  roc_lag_cleaned+
+                  gpa_cleaned+
+                  gpa_lag_cleaned+
+                  lev_cleaned+
+                  lev_lag_cleaned+             #10th var
+                  eyield_cleaned+
+                  eyield_lag_cleaned+
+                  divpo_cleaned+
+                  divpo_lag_cleaned+
+                  bm_cleaned+
+                  bm_lag_cleaned+
+                  revt_cleaned+
+                  revt_lag_cleaned+
+                  revt_growth_cleaned+
+                  optdr_lag_cleaned+           #20th var
+                  dlrsn_cleaned+
+                  auop_cleaned+
+                  auop_lag_cleaned+
+                  pmq_cleaned+
+                  pmq_lag1_cleaned+
+                  pmq_lag2_cleaned+
+                  pmq_lag3_cleaned+
+                  pmq_lag4_cleaned+
+                  aturnq_cleaned+
+                  aturnq_lag1_cleaned+         #30th var
+                  aturnq_lag2_cleaned+
+                  aturnq_lag3_cleaned+
+                  aturnq_lag4_cleaned+
+                  rocq_cleaned+
+                  rocq_lag1_cleaned+
+                  rocq_lag2_cleaned+
+                  rocq_lag3_cleaned+
+                  rocq_lag4_cleaned+
+                  gpaq_cleaned+
+                  gpaq_lag1_cleaned+            #40th var
+                  gpaq_lag2_cleaned+
+                  gpaq_lag3_cleaned+
+                  gpaq_lag4_cleaned+
+                  levq_cleaned+
+                  levq_lag1_cleaned+
+                  levq_lag2_cleaned+
+                  levq_lag3_cleaned+
+                  levq_lag4_cleaned+
+                  eyieldq_cleaned+
+                  eyieldq_lag1_cleaned+        #50th var
+                  eyieldq_lag2_cleaned+
+                  eyieldq_lag3_cleaned+
+                  eyieldq_lag4_cleaned+
+                  divpoq_cleaned+
+                  divpoq_lag1_cleaned+
+                  divpoq_lag2_cleaned+
+                  divpoq_lag3_cleaned+
+                  divpoq_lag4_cleaned+
+                  bmq_cleaned+
+                  bmq_lag1_cleaned+            #60th var
+                  bmq_lag2_cleaned+
+                  bmq_lag3_cleaned+
+                  bmq_lag4_cleaned+
+                  revtq_cleaned+
+                  revtq_lag1_cleaned+
+                  revtq_lag2_cleaned+
+                  revtq_lag3_cleaned+
+                  revtq_lag4_cleaned+
+                  revtq_growth1_cleaned+
+                  revtq_growth2_cleaned+       #70th var
+                  revtq_growth3_cleaned+
+                  revtq_growth4_cleaned+
+                  optdrq_lag1_cleaned+
+                  optdrq_lag2_cleaned+
+                  optdrq_lag3_cleaned+
+                  optdrq_lag4_cleaned+
+                  stockpx_cleaned+
+                  stockpx_lag1_cleaned+
+                  stockpx_lag2_cleaned+
+                  stockpx_lag3_cleaned+        #80th var
+                  pxchg1_cleaned+
+                  pxchg2_cleaned+
+                  no_of_tweets_cleaned+
+                  no_of_words_cleaned+
+                  max_fav_count_cleaned+
+                  sum_fav_count_cleaned+
+                  max_retweet_count_cleaned+
+                  sum_retweet_count_cleaned+
+                  isphoto_cleaned+
+                  ishashtag_cleaned+           #90th var
+                  dailymean_afinn_sen_cleaned+
+                  dailymean_word_sen_cleaned   #last var
+)
+
+
+xgboosttest_eq4331 = as.formula(followers_growth ~
+                  gvkey+                      #new
+                  day+                        #new
+                  pm_cleaned+
+                  pm_lag_cleaned+
+                  aturn_cleaned+
+                  aturn_lag_cleaned+
+                  roc_cleaned+
+                  roc_lag_cleaned+
+                  gpa_cleaned+
+                  gpa_lag_cleaned+
+                  lev_cleaned+
+                  lev_lag_cleaned+             #10th var
+                  eyield_cleaned+
+                  eyield_lag_cleaned+
+                  divpo_cleaned+
+                  divpo_lag_cleaned+
+                  bm_cleaned+
+                  bm_lag_cleaned+
+                  revt_cleaned+
+                  revt_lag_cleaned+
+                  revt_growth_cleaned+
+                  optdr_lag_cleaned+           #20th var
+                  dlrsn_cleaned+
+                  auop_cleaned+
+                  auop_lag_cleaned+
+                  pmq_cleaned+
+                  pmq_lag1_cleaned+
+                  pmq_lag2_cleaned+
+                  pmq_lag3_cleaned+
+                  pmq_lag4_cleaned+
+                  aturnq_cleaned+
+                  aturnq_lag1_cleaned+         #30th var
+                  aturnq_lag2_cleaned+
+                  aturnq_lag3_cleaned+
+                  aturnq_lag4_cleaned+
+                  rocq_cleaned+
+                  rocq_lag1_cleaned+
+                  rocq_lag2_cleaned+
+                  rocq_lag3_cleaned+
+                  rocq_lag4_cleaned+
+                  gpaq_cleaned+
+                  gpaq_lag1_cleaned+            #40th var
+                  gpaq_lag2_cleaned+
+                  gpaq_lag3_cleaned+
+                  gpaq_lag4_cleaned+
+                  levq_cleaned+
+                  levq_lag1_cleaned+
+                  levq_lag2_cleaned+
+                  levq_lag3_cleaned+
+                  levq_lag4_cleaned+
+                  eyieldq_cleaned+
+                  eyieldq_lag1_cleaned+        #50th var
+                  eyieldq_lag2_cleaned+
+                  eyieldq_lag3_cleaned+
+                  eyieldq_lag4_cleaned+
+                  divpoq_cleaned+
+                  divpoq_lag1_cleaned+
+                  divpoq_lag2_cleaned+
+                  divpoq_lag3_cleaned+
+                  divpoq_lag4_cleaned+
+                  bmq_cleaned+
+                  bmq_lag1_cleaned+            #60th var
+                  bmq_lag2_cleaned+
+                  bmq_lag3_cleaned+
+                  bmq_lag4_cleaned+
+                  revtq_cleaned+
+                  revtq_lag1_cleaned+
+                  revtq_lag2_cleaned+
+                  revtq_lag3_cleaned+
+                  revtq_lag4_cleaned+
+                  revtq_growth1_cleaned+
+                  revtq_growth2_cleaned+       #70th var
+                  revtq_growth3_cleaned+
+                  revtq_growth4_cleaned+
+                  optdrq_lag1_cleaned+
+                  optdrq_lag2_cleaned+
+                  optdrq_lag3_cleaned+
+                  optdrq_lag4_cleaned+
+                  stockpx_cleaned+
+                  stockpx_lag1_cleaned+
+                  stockpx_lag2_cleaned+
+                  stockpx_lag3_cleaned+        #80th var
+                  pxchg1_cleaned+
+                  pxchg2_cleaned+
+                  no_of_tweets_cleaned+
+                  no_of_words_cleaned+
+                  max_fav_count_cleaned+
+                  sum_fav_count_cleaned+
+                  max_retweet_count_cleaned+
+                  sum_retweet_count_cleaned+
+                  isphoto_cleaned+
+                  ishashtag_cleaned+           #90th var
+                  dailymean_afinn_sen_cleaned+
+                  dailymean_word_sen_cleaned   #last var
+)
+
+base <- mean(df_master_train$followers_growth)
+
+paramsPT <- list(max_depth=10, 
+               eta=0.5, 
+               booster ="gblinear",
+               objective = "reg:linear",
+               min_child_weight = 200,
+               gamma = 50,
+               subsample = 0.5, 
+               eval_metric="mae",
+               base_score = base)
+
+
+params <- list(max_depth=6,
+               eta=0.5,
+               booster="gblinear",
+               objective = "reg:linear",
+               min_child_weight =100,
+               subsample = 0.7,
+               eval_metric="mae",
+               base_score = base)
+
+ 
+
+ 
+
+
+```
+
+```{r, echo=FALSE, warning=FALSE}
+#Run XGBoost Parameters
+# XGBoost Model Setup
+xgb_eqnrun <- function(xgboost_eq, xgboosttest_eq, params, outputname) {
+ 
+
+
+
+set.seed(786354)
+
+x <- model.matrix(xgboost_eq, data=df_master_train)[, -1]                  #"-1" to remove the intercept 
+y <- model.frame(xgboost_eq, data=df_master_train)[,"followers_growth"]
+
+
+xgbCV <- xgb.cv(params=params,
+                data=x,
+                label=y,
+                rediction=TRUE,
+                maximize=FALSE,
+                nfold=10,
+                nrounds=500,
+                early_stopping_rounds = 100,
+                print_every_n = 10,
+                verbose=1)
+
+numTrees <- min(which(xgbCV$evaluation_log$test_mae_mean == 
+                      min(xgbCV$evaluation_log$test_mae_mean))) 
+
+fit_XGB <- xgboost(params=params,
+                data = x,
+                label = y,
+                nrounds = numTrees,
+                print_every_n = 5,
+                verbose = 1)
+
+
+
+
+
+
+#Plot importance
+
+xgb.train.data = xgb.DMatrix(x, label = y, missing = NA)
+col_names = attr(xgb.train.data, ".Dimnames")[[2]]
+imp = xgb.importance(col_names, fit_XGB)
+xgb.plot.importance(imp[1:15])
+
+print(imp[1:15])
+
+
+#Running test set.
+xtest <- model.matrix(xgboosttest_eq, data=df_master_test)[,-1]
+pred.xgb <- predict(fit_XGB, xtest)
+output_df <- as.data.frame(pred.xgb)
+colnames(output_df) <- 'followers_growth'
+
+
+#predoutput <- cbind(df_master_test[df_master_test$gvkey==1161,c("ID", "followers_test","date")],output_df )
+predoutput <- cbind(df_master_test[,c("ID", "gvkey", "followers_test","date")],output_df )
+predoutput <- predoutput %>% arrange(gvkey,date)
+predoutput$row <- seq.int(nrow(predoutput))
+
+gvkeycount <- length(unique(predoutput$gvkey))
+gvkeylist <- unique(predoutput$gvkey)
+for (i in 1:gvkeycount) {
+  predoutputtemp <- predoutput %>% filter(gvkey==gvkeylist[i])
+
+  for (row in 1:nrow(predoutputtemp)){
+  
+    if (row==1) {
+      predoutputtemp[row,"followers"] <-(1+predoutputtemp[row,"followers_growth"])*predoutputtemp[row,"followers_test"]
+    } else {
+      predoutputtemp[row,"followers"] <-(1+predoutputtemp[row,"followers_growth"])*predoutputtemp[row-1,"followers"]
+    }
+  }
+  if(i==1) {
+    xgout <- predoutputtemp
+  } else {
+    xgout <- rbind(xgout,predoutputtemp)
+  }
+}
+xgout
+  
+xgbupload <- select(xgout,c(ID,followers))
+
+xgbupload
+
+f <- paste0("Data_Files/3output/",outputname)
+if (file.exists(f)) {
+  cat("\n", f, "already created")
+} else {
+  write.csv(xgbupload, f, row.names = FALSE)
+  cat("\nNew",f,"created")
+}
+
+}
+```
+```{r, echo = FALSE, eval=TRUE, warning=FALSE}
+#Running Differemt Eqn:
+
+#xgboosttest_eq4331PT
+xgb_eqnrun(xgboost_eq4331, xgboosttest_eq4331, paramsPT, "xgb4331PT.csv") 
+```
+```{r, echo = FALSE}
+xgb_eqnrun(xgboost_eq4332, xgboosttest_eq4332, paramsPT, "xgb4332PT.csv") 
+```
+```{r, echo = FALSE, warning=FALSE}
+xgb_eqnrun(xgboost_eq4333, xgboosttest_eq4333, paramsPT, "xgb4333PT.csv") 
+```
+```{r, echo = FALSE, warning=FALSE}
+xgb_eqnrun(xgboost_eq4331, xgboosttest_eq4331, params, "xgb4331.csv") 
+```
+```{r, echo = FALSE, warning=FALSE}
+xgb_eqnrun(xgboost_eq4332, xgboosttest_eq4332, params, "xgb4332.csv") 
+```
+```{r, echo = FALSE, warning=FALSE}
+xgb_eqnrun(xgboost_eq4333, xgboosttest_eq4333, params, "xgb4333.csv")
+```
+
+
+
+
+# Report Section 4.4: Times Series Modelling
+
+```{r Timeseries Pre-processing, echo=FALSE}
+#Get Tweets Text Sentiment
+tweets_sen <- tweets[,c("gvkey","created_at","text")]
+tweets_sen$date <- as.Date(tweets_sen$created_at)
+tweets_sen <- tweets_sen %>% 
+  mutate(linenumber=row_number(),
+         word_count = lengths(gregexpr("\\W+", text)) + 1) %>%
+  group_by(gvkey,date) %>%
+  unnest_tokens(word,text) %>%
+  ungroup()
+tweets_sen <- tweets_sen %>% anti_join(stop_words,by = "word") %>%
+  inner_join(get_sentiments("afinn"),by = "word") %>% 
+  group_by(gvkey,date,linenumber) %>%
+  mutate(sen=sum(value)) %>%
+  ungroup() %>%
+  count(gvkey, date, linenumber, sen, word_count) %>%
+  mutate(avg_sen=sen/n) %>%
+  mutate(word_sen=sen/word_count)
+
+
+tweets_ex <- tweets[,c("gvkey","created_at" ,"favorite_count","retweet_count","media_type","hashtags")]
+tweets_ex$date <- as.Date(tweets_ex$created_at)
+tweets_ex <- left_join(tweets_ex, tweets_sen, by=c("gvkey","date"))
+tweets_ex <- tweets_ex %>% mutate(photo = ifelse(media_type %in% c("photo","photo|photo"),1,0)) %>%
+  group_by(gvkey,date) %>% 
+  mutate(no_of_tweets = n(),
+         max_fav_count = max(favorite_count),
+         max_retweet_count = max(retweet_count),
+         isphoto = sum(photo),
+         hashtag = ifelse((hashtags==""),0,1),
+         ishashtag = sum(hashtag),
+         dailymean_afinn_sen = mean(avg_sen, na.rm = TRUE),
+         dailymean_word_sen = mean(word_sen, na.rm = TRUE)) %>% 
+  dplyr::slice(1) %>% ungroup()
+tweets_ex <- tweets_ex[,c("gvkey","date", "no_of_tweets", 
+                          "max_fav_count","max_retweet_count","isphoto","ishashtag", 
+                          "dailymean_afinn_sen","dailymean_word_sen")]   
+
+
+stockpx <- stockpx[stockpx$iid=="01",]
+stockpx$date <- ymd(stockpx$datadate)
+stockpx <- stockpx[,c("gvkey","date","prccd")]
+
+uniquegvkey <- unique(train$gvkey)
+seqdates <- seq(as.Date("2016-01-01"), as.Date("2017-09-30"), by="days")
+gvkey_seqdates <- rep(uniquegvkey, each=length(seqdates))
+daterep_seqdates <- rep(seqdates,length(uniquegvkey)) 
+stockpx_ts <- data.frame(gvkey=gvkey_seqdates, date=daterep_seqdates)
+stockpx_ts <- left_join(stockpx_ts,stockpx,by=c("gvkey","date"))
+stockpx_ts <- stockpx_ts %>% arrange(gvkey,date) %>% na_locf() %>% 
+  mutate(stockpxup = ifelse(lag(prccd)-lag(prccd,2)>0,1,0),
+         day=as.POSIXlt(date)$wday) %>% ungroup()
+stockpx_ts[stockpx_ts$day==0,]$day <- 7
+train$date <- ymd(train$date)
+test$date <- ymd(test$date)
+traindates <- seq(as.Date("2017-01-01"), as.Date("2017-06-30"), by="days")
+trainingdays <- length(traindates)
+gvkey_train <- rep(uniquegvkey, each=trainingdays)
+daterep_train <- rep(traindates,length(uniquegvkey)) 
+training <- data.frame(gvkey=gvkey_train, date=daterep_train)
+training <- left_join(training, train, by=c("gvkey","date"))
+training <- training[,c("date", "gvkey", "followers")]
+training <- left_join(training, stockpx_ts[,c("gvkey","date","stockpxup","day")], by=c("gvkey","date"))
+training <- left_join(training, tweets_ex,by=c("gvkey","date"))
+training_ts <- xts(training[,-1], order.by=training[,1])
+
+testdates <- seq(as.Date("2017-07-01"), as.Date("2017-09-30"), by="days")
+testingdays <- length(testdates)
+gvkey_test <- rep(uniquegvkey, each=testingdays)
+daterep_test <- rep(testdates,length(uniquegvkey)) 
+testing <- data.frame(gvkey=gvkey_test, date=daterep_test)
+testing <- left_join(testing, stockpx_ts[,c("gvkey","date","stockpxup","day")], by=c("gvkey","date") )
+testing <- left_join(testing, tweets_ex,by=c("gvkey","date"))
+testing <- testing[,c("date", "gvkey", "stockpxup","day","no_of_tweets", "max_fav_count","max_retweet_count","isphoto","ishashtag","dailymean_afinn_sen","dailymean_word_sen")]
+testing_ts <-  xts(testing[,-1], order.by=testing[,1])
+
+```
+
+## Model 4.4.1 - TIMESERIES MODEL 1: Followers 
+Timseries model 1 predicts followers count solely using historical followers count data. It followers the autoregressive integrated moving average model with orders (p,d,q). As each firm (with different gvkey) will have different followers growth patters, one arima model is ran for each gvkey, and the followers count forecast is also done separately for each gvkey.
+
+### {.tabset .tabset-fade .tabset-dropdown}
+```{r tsam1, echo=FALSE, results='asis'}
+for (i in 1:95) {
+  temp <- training_ts[training_ts$gvkey==uniquegvkey[i],c("followers")]
+  temp <- na.approx(zoo(temp$followers, as.Date("2017-01-01") + 1:trainingdays-1), na.rm = FALSE)
+  temp <-  na_locf(temp$followers, option = 'nocb')
+  tempfitarima <- auto.arima(temp)
+  forarima <- forecast(tempfitarima,h=testingdays)
+  accuracy <- accuracy(tempfitarima)
+  if(i==1){
+    insamplemae <- data.frame(gvkey=uniquegvkey[i], MAE=accuracy[3])
+  } else {
+    addinsamplemae <- data.frame(gvkey=uniquegvkey[i], MAE=accuracy[3])
+    insamplemae <- rbind(insamplemae, addinsamplemae)
+  }
+  
+  if(i==1){
+    modelaicc <- data.frame(gvkey=uniquegvkey[i], AICc=tempfitarima$aicc)
+  } else {
+    addmodelaicc <- data.frame(gvkey=uniquegvkey[i], AICc=tempfitarima$aicc)
+    modelaicc <- rbind(modelaicc, addmodelaicc)
+  }
+  
+  cat("####", uniquegvkey[i], " \n")
+  cat(paste0("Arima model for gvkey: ",uniquegvkey[i]), " \n")
+  cat(paste0("AICc: ", round(tempfitarima$aicc,4)), " \n")
+  cat(paste0("Training Set MAE: ", round(accuracy[3],4)), " \n")
+  coef <- as.data.frame.numeric(tempfitarima$coef)
+  colnames(coef) <- "coefficient_value"
+  print(kable(coef) %>% kable_styling(bootstrap_options = 'striped',full_width = FALSE, position="left"))
+  plot(forarima, xaxt='n')
+  axis(side=1, at= seq(as.Date("2017-01-01"), as.Date("2017-10-01"), "months"),format(seq(as.Date("2017-01-01"), as.Date("2017-10-01"), "months"), "%b"), cex.axis = .7)
+  cat(' \n\n')
+  
+  if(nrow(coef)>0) {
+    coef$gvkey <- uniquegvkey[i]
+    coef <- tibble::rownames_to_column(coef,"name")
+    if(i==1){
+      coeflist <- coef
+    }else{
+      coeflist <- rbind(coeflist,coef)
+    }
+  }
+  if(i==1){
+    predarima <- data.frame(date=testdates, gvkey=uniquegvkey[i], followers=as.numeric(forarima[[4]]))
+  } else {
+    addpredarima <- data.frame(date=testdates, gvkey=uniquegvkey[i], followers=as.numeric(forarima[[4]]))
+    predarima <- rbind(predarima, addpredarima)
+  }
+}
+model441mae <- insamplemae
+model441aicc <- modelaicc
+model441pred <- predarima
+coeflist441 <- coeflist
+```
+
+## 
+```{r tsam1coeflist, echo=FALSE }
+mediandf <- coeflist441[coeflist441$name != "drift",c("name","coefficient_value")] %>% 
+  group_by(name) %>% 
+  mutate(median = median(coefficient_value)) %>% 
+  ungroup()
+mediandf <- mediandf[,c("name","median")]
+colnames(mediandf) <- c("name","coefficient_value")
+mediandf$gvkey <- "median"  
+coeflist441 <- coeflist441[coeflist441$name != "drift",]
+coef441plot <-  ggplot(coeflist441,aes(x=name, y=coefficient_value)) +
+                  geom_point(aes(col=factor(gvkey)),shape=21, position=position_jitter(width = 0.1), fill='cyan') + 
+                  geom_errorbar(data=mediandf, width=0.6, aes(ymax=coefficient_value, ymin=coefficient_value), color="black")+
+                  geom_abline(slope=0, col="darkred",linetype="dashed")+
+                  theme(legend.position = "none") + 
+                  labs(x="Coefficient Name", y = "Coefficient Value", title = "Model 4.4.1 - Coefficient Values Plot")+
+                  theme(axis.text.x  = element_text(angle=45, hjust = 1))
+ggplotly(coef441plot) %>% 
+  layout(title = list(text = paste0('Model 4.4.1 - Coefficient Values Plot',
+                                    '<br>',
+                                    '<sup>',
+                                    '(black line represent the median value for the coefficient)',
+                                    '</sup>')))
+```
+
+## Model 4.4.2 - TIMESERIES MODEL 2: Followers and Day of the Week 
+Timeseries model 2 predicts followers count using historical followers count data, and with an external (exogenous) variable - Day of the Week. The Day of the Week is a numeric variable which Monday is 1, Tuesday is 2, and so on, while Sunday is 0. 
+
+###  {.tabset .tabset-fade .tabset-dropdown}
+```{r tsam3, echo=FALSE, results='asis'}
+for (i in 1:95) {
+  temp <- training_ts[training_ts$gvkey==uniquegvkey[i],c("followers")]
+  temp <- na.approx(zoo(temp$followers, as.Date("2017-01-01") + 1:trainingdays-1), na.rm = FALSE)
+  temp <-  na_locf(temp$followers, option = 'nocb')
+  xreg <-model.matrix(~as.factor((training_ts[training_ts$gvkey==uniquegvkey[i],c("day")])$day))[,-1]
+  colnames(xreg) <- c("Tue","Wed","Thu","Fri","Sat","Sun")
+  tempfitarima <- auto.arima(temp,xreg=xreg)
+  xregtest <- model.matrix(~as.factor((testing_ts[testing_ts$gvkey==uniquegvkey[i],c("day")])$day))[,-1]
+  colnames(xregtest) <- c("Tue","Wed","Thu","Fri","Sat","Sun")
+  forarima <- forecast(tempfitarima,h=testingdays, xreg=xregtest)
+  
+  accuracy <- accuracy(tempfitarima)
+  if(i==1){
+    insamplemae <- data.frame(gvkey=uniquegvkey[i], MAE=accuracy[3])
+  } else {
+    addinsamplemae <- data.frame(gvkey=uniquegvkey[i], MAE=accuracy[3])
+    insamplemae <- rbind(insamplemae, addinsamplemae)
+  }  
+  
+  if(i==1){
+    modelaicc <- data.frame(gvkey=uniquegvkey[i], AICc=tempfitarima$aicc)
+  } else {
+    addmodelaicc <- data.frame(gvkey=uniquegvkey[i], AICc=tempfitarima$aicc)
+    modelaicc <- rbind(modelaicc, addmodelaicc)
+  }
+  
+  cat("####", uniquegvkey[i], " \n")
+  cat(paste0("Arima model for gvkey: ",uniquegvkey[i]), " \n")
+  cat(paste0("AICc: ", round(tempfitarima$aicc,4)), " \n")
+  cat(paste0("Training Set MAE: ", round(accuracy[3],4)), " \n")
+  coef <- as.data.frame.numeric(tempfitarima$coef)
+  colnames(coef) <- "coefficient_value"
+  print(kable(coef) %>% kable_styling(bootstrap_options = 'striped',full_width = FALSE, position="left"))
+  plot(forarima, xaxt='n')
+  axis(side=1, at= seq(as.Date("2017-01-01"), as.Date("2017-10-01"), "months"),format(seq(as.Date("2017-01-01"), as.Date("2017-10-01"), "months"), "%b"), cex.axis = .7)
+  cat(' \n\n')
+  
+  if(nrow(coef)>0) {
+    coef$gvkey <- uniquegvkey[i]
+    coef <- tibble::rownames_to_column(coef,"name")
+    if(i==1){
+      coeflist <- coef
+    }else{
+      coeflist <- rbind(coeflist,coef)
+    }
+  }
+  
+  if(i==1){
+    predarima <- data.frame(date=testdates, gvkey=uniquegvkey[i], followers=as.numeric(forarima[[4]]))
+  } else {
+    addpredarima <- data.frame(date=testdates, gvkey=uniquegvkey[i], followers=as.numeric(forarima[[4]]))
+    predarima <- rbind(predarima, addpredarima)
+  }
+}
+model442mae <- insamplemae
+model442aicc <- modelaicc
+model442pred <- predarima
+coeflist442 <- coeflist
+```
+
+## 
+```{r tsam3coeflist, echo=FALSE }
+mediandf <- coeflist442[coeflist442$name != "drift",c("name","coefficient_value")] %>% 
+  group_by(name) %>% 
+  mutate(median = median(coefficient_value)) %>% 
+  ungroup()
+mediandf <- mediandf[,c("name","median")]
+colnames(mediandf) <- c("name","coefficient_value")
+mediandf$gvkey <- "median"  
+coeflist442 <- coeflist442[coeflist442$name != "drift",]
+coef442plot <-  ggplot(coeflist442,aes(x=name, y=coefficient_value)) +
+                  geom_point(aes(col=factor(gvkey)),shape=21, position=position_jitter(width = 0.1), fill='cyan') + 
+                  geom_errorbar(data=mediandf, width=0.6, aes(ymax=coefficient_value, ymin=coefficient_value), color="black")+
+                  geom_abline(slope=0, col="darkred",linetype="dashed")+
+                  theme(legend.position = "none") + 
+                  labs(x="Coefficient Name", y = "Coefficient Value", title = "Model 4.4.2 - Coefficient Values Plot")+
+                  theme(axis.text.x  = element_text(angle=45, hjust = 1))
+ggplotly(coef442plot) %>% 
+  layout(title = list(text = paste0('Model 4.4.2 - Coefficient Values Plot',
+                                    '<br>',
+                                    '<sup>',
+                                    '(black line represent the median value for the coefficient)',
+                                    '</sup>')))
+```
+
+## Model 4.4.3 - TIME SERIES MODEL 3: Followers with No. of Tweets 
+Timeseries model 3 predicts followers count using historical followers count data, and with an external (exogenous) variable - Number of Tweets made in a day. If there is no tweet related data available for a particular gvkey throughout the entire training/testing data period, the model will predict followers count using only the historical followers count data. 
+
+###  {.tabset .tabset-fade .tabset-dropdown}
+```{r tsam7, echo=FALSE, results='asis'}
+for (i in 1:95) {
+  temp <- training_ts[training_ts$gvkey==uniquegvkey[i],c("followers")]
+  temp <- na.approx(zoo(temp$followers, as.Date("2017-01-01") + 1:trainingdays-1), na.rm = FALSE)
+  temp <-  na_locf(temp$followers, option = 'nocb')
+  if(nrow(training_ts[(is.na(training_ts$no_of_tweets) & training_ts$gvkey==uniquegvkey[i]),])==trainingdays | 
+     nrow(testing_ts[(is.na(testing_ts$no_of_tweets) & testing_ts$gvkey==uniquegvkey[i]),])==testingdays){
+    tempfitarima <- auto.arima(temp)
+    forarima <- forecast(tempfitarima,h=testingdays)    
+  } else {
+    xreg <- training_ts[training_ts$gvkey==uniquegvkey[i],c("no_of_tweets")]
+    xreg[is.na(xreg$no_of_tweets)] <- 0
+    tempfitarima <- auto.arima(temp,xreg=xreg)
+    xregtest <- testing_ts[testing_ts$gvkey==uniquegvkey[i],c("no_of_tweets")]
+    xregtest[is.na(xregtest$no_of_tweets)] <- 0
+    forarima <- forecast(tempfitarima,h=testingdays, xreg=xregtest)
+  }
+  
+   accuracy <- accuracy(tempfitarima)
+  if(i==1){
+    insamplemae <- data.frame(gvkey=uniquegvkey[i], MAE=accuracy[3])
+  } else {
+    addinsamplemae <- data.frame(gvkey=uniquegvkey[i], MAE=accuracy[3])
+    insamplemae <- rbind(insamplemae, addinsamplemae)
+  }  
+   
+  if(i==1){
+    modelaicc <- data.frame(gvkey=uniquegvkey[i], AICc=tempfitarima$aicc)
+  } else {
+    addmodelaicc <- data.frame(gvkey=uniquegvkey[i], AICc=tempfitarima$aicc)
+    modelaicc <- rbind(modelaicc, addmodelaicc)
+  }
+   
+  cat("####", uniquegvkey[i], " \n")
+  cat(paste0("Arima model for gvkey: ",uniquegvkey[i]), " \n")
+  cat(paste0("AICc: ", round(tempfitarima$aicc,4)), " \n")
+  cat(paste0("Training Set MAE: ", round(accuracy[3],4)), " \n")
+  coef <- as.data.frame.numeric(tempfitarima$coef)
+  colnames(coef) <- "coefficient_value"
+  print(kable(coef) %>% kable_styling(bootstrap_options = 'striped',full_width = FALSE, position="left"))
+  plot(forarima, xaxt='n')
+  axis(side=1, at= seq(as.Date("2017-01-01"), as.Date("2017-10-01"), "months"),format(seq(as.Date("2017-01-01"), as.Date("2017-10-01"), "months"), "%b"), cex.axis = .7)
+  cat(' \n\n')
+  
+  if(nrow(coef)>0) {
+    coef$gvkey <- uniquegvkey[i]
+    coef <- tibble::rownames_to_column(coef,"name")
+    if(i==1){
+      coeflist <- coef
+    }else{
+      coeflist <- rbind(coeflist,coef)
+    }
+  }
+  
+  if(i==1){
+    predarima <- data.frame(date=testdates, gvkey=uniquegvkey[i], followers=as.numeric(forarima[[4]]))
+  } else {
+    addpredarima <- data.frame(date=testdates, gvkey=uniquegvkey[i], followers=as.numeric(forarima[[4]]))
+    predarima <- rbind(predarima, addpredarima)
+  }
+}
+model443mae <- insamplemae
+model443aicc <- modelaicc
+model443pred <- predarima
+coeflist443 <- coeflist
+```
+
+## 
+```{r tsam7coeflist, echo=FALSE }
+mediandf <- coeflist443[coeflist443$name != "drift",c("name","coefficient_value")] %>% 
+  group_by(name) %>% 
+  mutate(median = median(coefficient_value)) %>% 
+  ungroup()
+mediandf <- mediandf[,c("name","median")]
+colnames(mediandf) <- c("name","coefficient_value")
+mediandf$gvkey <- "median"  
+coeflist443 <- coeflist443[coeflist443$name != "drift",]
+coef443plot <-  ggplot(coeflist443,aes(x=name, y=coefficient_value)) +
+                  geom_point(aes(col=factor(gvkey)),shape=21, position=position_jitter(width = 0.1), fill='cyan') + 
+                  geom_errorbar(data=mediandf, width=0.6, aes(ymax=coefficient_value, ymin=coefficient_value), color="black")+
+                  geom_abline(slope=0, col="darkred",linetype="dashed")+
+                  theme(legend.position = "none") + 
+                  labs(x="Coefficient Name", y = "Coefficient Value", title = "Model 4.4.3 - Coefficient Values Plot")+
+                  theme(axis.text.x  = element_text(angle=45, hjust = 1))
+ggplotly(coef443plot) %>% 
+  layout(title = list(text = paste0('Model 4.4.3 - Coefficient Values Plot',
+                                    '<br>',
+                                    '<sup>',
+                                    '(black line represent the median value for the coefficient)',
+                                    '</sup>')))
+```
+
+## Model 4.4.4 - TIMESERIES MODEL 4: Followers with No. of Tweets with Images
+Timeseries model 4 predicts followers count using historical followers count data, and with an external (exogenous) variable - Number of Tweets with Images made in a day. If there is no tweet related data available for a particular gvkey throughout the entire training/testing data period, the model will predict followers count using only the historical followers count data. 
+
+###  {.tabset .tabset-fade .tabset-dropdown}
+```{r tsam8, echo=FALSE, results='asis'}
+for (i in 1:95) {
+  temp <- training_ts[training_ts$gvkey==uniquegvkey[i],c("followers")]
+  temp <- na.approx(zoo(temp$followers, as.Date("2017-01-01") + 1:trainingdays-1), na.rm = FALSE)
+  temp <-  na_locf(temp$followers, option = 'nocb')
+  xreg_temp <- training_ts[training_ts$gvkey==uniquegvkey[i],c("isphoto")]
+  xreg_temp[is.na(xreg_temp$isphoto)] <- 0
+  xregtest_temp <- testing_ts[testing_ts$gvkey==uniquegvkey[i],c("isphoto")]
+  xregtest_temp[is.na(xregtest_temp$isphoto)] <- 0
+  if(sum(xreg_temp)< 1 | sum(xregtest_temp)< 1){
+    tempfitarima <- auto.arima(temp)
+    forarima <- forecast(tempfitarima,h=testingdays)
+  } else {
+    xreg <- xreg_temp
+    tempfitarima <- auto.arima(temp,xreg=xreg)
+    xregtest <- xregtest_temp
+    forarima <- forecast(tempfitarima,h=testingdays, xreg=xregtest)
+  }
+  
+  accuracy <- accuracy(tempfitarima)
+  if(i==1){
+    insamplemae <- data.frame(gvkey=uniquegvkey[i], MAE=accuracy[3])
+  } else {
+    addinsamplemae <- data.frame(gvkey=uniquegvkey[i], MAE=accuracy[3])
+    insamplemae <- rbind(insamplemae, addinsamplemae)
+  }  
+  
+  if(i==1){
+    modelaicc <- data.frame(gvkey=uniquegvkey[i], AICc=tempfitarima$aicc)
+  } else {
+    addmodelaicc <- data.frame(gvkey=uniquegvkey[i], AICc=tempfitarima$aicc)
+    modelaicc <- rbind(modelaicc, addmodelaicc)
+  }
+  
+  cat("####", uniquegvkey[i], " \n")
+  cat(paste0("Arima model for gvkey: ",uniquegvkey[i]), " \n")
+  cat(paste0("AICc: ", round(tempfitarima$aicc,4)), " \n")
+  cat(paste0("Training Set MAE: ", round(accuracy[3],4)), " \n")
+  coef <- as.data.frame.numeric(tempfitarima$coef)
+  colnames(coef) <- "coefficient_value"
+  print(kable(coef) %>% kable_styling(bootstrap_options = 'striped',full_width = FALSE, position="left"))
+  plot(forarima, xaxt='n')
+  axis(side=1, at= seq(as.Date("2017-01-01"), as.Date("2017-10-01"), "months"),format(seq(as.Date("2017-01-01"), as.Date("2017-10-01"), "months"), "%b"), cex.axis = .7)
+  cat(' \n\n')
+  
+  if(nrow(coef)>0) {
+    coef$gvkey <- uniquegvkey[i]
+    coef <- tibble::rownames_to_column(coef,"name")
+    if(i==1){
+      coeflist <- coef
+    }else{
+      coeflist <- rbind(coeflist,coef)
+    }
+  }
+ 
+  if(i==1){
+    predarima <- data.frame(date=testdates, gvkey=uniquegvkey[i], followers=as.numeric(forarima[[4]]))
+  } else {
+    addpredarima <- data.frame(date=testdates, gvkey=uniquegvkey[i], followers=as.numeric(forarima[[4]]))
+    predarima <- rbind(predarima, addpredarima)
+  }
+}
+model444mae <- insamplemae
+model444aicc <- modelaicc
+model444pred <- predarima
+coeflist444 <- coeflist
+```
+
+## 
+```{r tsam8coeflist, echo=FALSE }
+mediandf <- coeflist444[coeflist444$name != "drift",c("name","coefficient_value")] %>% 
+  group_by(name) %>% 
+  mutate(median = median(coefficient_value)) %>% 
+  ungroup()
+mediandf <- mediandf[,c("name","median")]
+colnames(mediandf) <- c("name","coefficient_value")
+mediandf$gvkey <- "median"  
+coeflist444 <- coeflist444[coeflist444$name != "drift",]
+coef444plot <-  ggplot(coeflist444,aes(x=name, y=coefficient_value)) +
+                  geom_point(aes(col=factor(gvkey)),shape=21, position=position_jitter(width = 0.1), fill='cyan') + 
+                  geom_errorbar(data=mediandf, width=0.6, aes(ymax=coefficient_value, ymin=coefficient_value), color="black")+
+                  geom_abline(slope=0, col="darkred",linetype="dashed")+
+                  theme(legend.position = "none") + 
+                  labs(x="Coefficient Name", y = "Coefficient Value", title = "Model 4.4.4 - Coefficient Values Plot")+
+                  theme(axis.text.x  = element_text(angle=45, hjust = 1))
+ggplotly(coef444plot) %>% 
+  layout(title = list(text = paste0('Model 4.4.4 - Coefficient Values Plot',
+                                    '<br>',
+                                    '<sup>',
+                                    '(black line represent the median value for the coefficient)',
+                                    '</sup>')))
+```
+
+## Model 4.4.5 - TIMESERIES MODEL 5: Followers with Tweet Sentiment Scores
+Timeseries model 5 predicts followers count using historical followers count data, and with an external (exogenous) variable - daily mean Tweet Sentiment Score. The  sentiment scores calculated the average sentiment score of each tweet by summing up the total afinn score for all the afinn-matched words in the tweet divided by the total number of words. In event that there are more than one tweet made in a day, a daily mean is calculated from all the average sentiment score for each tweet. If there is no tweet related data available for a particular gvkey throughout the entire training/testing data period, the model will predict followers count using only the historical followers count data.
+
+###  {.tabset .tabset-fade .tabset-dropdown}
+```{r tsam16, echo=FALSE, results='asis'}
+for (i in 1:95) {
+  temp <- training_ts[training_ts$gvkey==uniquegvkey[i],c("followers")]
+  temp <- na.approx(zoo(temp$followers, as.Date("2017-01-01") + 1:trainingdays-1), na.rm = FALSE)
+  temp <-  na_locf(temp$followers, option = 'nocb')
+  if(nrow(training_ts[(is.na(training_ts$dailymean_word_sen) & training_ts$gvkey==uniquegvkey[i]),])==trainingdays | 
+     nrow(testing_ts[(is.na(testing_ts$dailymean_word_sen) & testing_ts$gvkey==uniquegvkey[i]),])==testingdays){
+    tempfitarima <- auto.arima(temp)
+    forarima <- forecast(tempfitarima,h=testingdays)    
+  } else {
+    xreg <- training_ts[training_ts$gvkey==uniquegvkey[i],c("dailymean_word_sen")]
+    xreg[is.na(xreg$dailymean_word_sen)] <- 0
+    tempfitarima <- auto.arima(temp,xreg=xreg)
+    xregtest <- testing_ts[testing_ts$gvkey==uniquegvkey[i],c("dailymean_word_sen")]
+    xregtest[is.na(xregtest$dailymean_word_sen)] <- 0
+    forarima <- forecast(tempfitarima,h=testingdays, xreg=xregtest)
+  }
+  accuracy <- accuracy(tempfitarima)
+  if(i==1){
+    insamplemae <- data.frame(gvkey=uniquegvkey[i], MAE=accuracy[3])
+  } else {
+    addinsamplemae <- data.frame(gvkey=uniquegvkey[i], MAE=accuracy[3])
+    insamplemae <- rbind(insamplemae, addinsamplemae)
+  }  
+  
+  if(i==1){
+    modelaicc <- data.frame(gvkey=uniquegvkey[i], AICc=tempfitarima$aicc)
+  } else {
+    addmodelaicc <- data.frame(gvkey=uniquegvkey[i], AICc=tempfitarima$aicc)
+    modelaicc <- rbind(modelaicc, addmodelaicc)
+  }
+  
+  cat("####", uniquegvkey[i], " \n")
+  cat(paste0("Arima model for gvkey: ",uniquegvkey[i]), " \n")
+  cat(paste0("AICc: ", round(tempfitarima$aicc,4)), " \n")
+  cat(paste0("Training Set MAE: ", round(accuracy[3],4)), " \n")
+  coef <- as.data.frame.numeric(tempfitarima$coef)
+  colnames(coef) <- "coefficient_value"
+  print(kable(coef) %>% kable_styling(bootstrap_options = 'striped',full_width = FALSE, position="left"))
+  plot(forarima, xaxt='n')
+  axis(side=1, at= seq(as.Date("2017-01-01"), as.Date("2017-10-01"), "months"),format(seq(as.Date("2017-01-01"), as.Date("2017-10-01"), "months"), "%b"), cex.axis = .7)
+  cat(' \n\n')
+  
+  if(nrow(coef)>0) {
+    coef$gvkey <- uniquegvkey[i]
+    coef <- tibble::rownames_to_column(coef,"name")
+    if(i==1){
+      coeflist <- coef
+    }else{
+      coeflist <- rbind(coeflist,coef)
+    }
+  }
+   
+  if(i==1){
+    predarima <- data.frame(date=testdates, gvkey=uniquegvkey[i], followers=as.numeric(forarima[[4]]))
+  } else {
+    addpredarima <- data.frame(date=testdates, gvkey=uniquegvkey[i], followers=as.numeric(forarima[[4]]))
+    predarima <- rbind(predarima, addpredarima)
+  }
+}
+model445mae <- insamplemae
+model445aicc <- modelaicc
+model445pred <- predarima
+coeflist445 <- coeflist
+```
+
+## 
+```{r tsam16coeflist, echo=FALSE }
+mediandf <- coeflist445[coeflist445$name != "drift",c("name","coefficient_value")] %>% 
+  group_by(name) %>% 
+  mutate(median = median(coefficient_value)) %>% 
+  ungroup()
+mediandf <- mediandf[,c("name","median")]
+colnames(mediandf) <- c("name","coefficient_value")
+mediandf$gvkey <- "median"  
+coeflist445 <- coeflist445[coeflist445$name != "drift",]
+coef445plot <-  ggplot(coeflist445,aes(x=name, y=coefficient_value)) +
+                  geom_point(aes(col=factor(gvkey)),shape=21, position=position_jitter(width = 0.1), fill='cyan') + 
+                  geom_errorbar(data=mediandf, width=0.6, aes(ymax=coefficient_value, ymin=coefficient_value), color="black")+
+                  geom_abline(slope=0, col="darkred",linetype="dashed")+
+                  theme(legend.position = "none") + 
+                  labs(x="Coefficient Name", y = "Coefficient Value", title = "Model 4.4.5 - Coefficient Values Plot")+
+                  theme(axis.text.x  = element_text(angle=45, hjust = 1))
+ggplotly(coef445plot) %>% 
+  layout(title = list(text = paste0('Model 4.4.5 - Coefficient Values Plot',
+                                    '<br>',
+                                    '<sup>',
+                                    '(black line represent the median value for the coefficient)',
+                                    '</sup>')))
+```
+
+## Model 4.4.6 - TIMESERIES MODEL 6: Followers with Day of the Week, No.of Tweets and No. of Tweets with Images
+Timeseries model 6 predicts followers count using historical followers count data, and with three external (exogenous) variables - Day of the Week, Number of Tweets, and Number of Tweets with Images made in a day. Should any of the external variables are constant throughout the entire training/testing period (i.e. making it indifferent to include the variable), the model will be ran without this variable. If there is no tweet related data available for a particular gvkey throughout the entire training/testing data period, the model will predict followers count using the historical followers count data with external (exogenous) variable - Day of the Week.
+
+###   {.tabset .tabset-fade .tabset-dropdown}
+```{r tsam14, echo=FALSE, results='asis'}
+for (i in 1:95) {
+  temp <- training_ts[training_ts$gvkey==uniquegvkey[i],c("followers")]
+  temp <- na.approx(zoo(temp$followers, as.Date("2017-01-01") + 1:trainingdays-1), na.rm = FALSE)
+  temp <-  na_locf(temp$followers, option = 'nocb')
+  xregphoto_temp <- training_ts[training_ts$gvkey==uniquegvkey[i],c("isphoto")]
+  xregphoto_temp[is.na(xregphoto_temp$isphoto)] <- 0
+  xregtestphoto_temp <- testing_ts[testing_ts$gvkey==uniquegvkey[i],c("isphoto")]
+  xregtestphoto_temp[is.na(xregtestphoto_temp$isphoto)] <- 0
+  if((sum(xregphoto_temp)< 1 | sum(xregtestphoto_temp)< 1) & 
+     (nrow(training_ts[(is.na(training_ts$no_of_tweets) & training_ts$gvkey==uniquegvkey[i]),])==trainingdays | 
+      nrow(testing_ts[(is.na(testing_ts$no_of_tweets) & testing_ts$gvkey==uniquegvkey[i]),])==testingdays)){
+    xreg <- model.matrix(~as.factor((training_ts[training_ts$gvkey==uniquegvkey[i],c("day")])$day))[,-1]
+    colnames(xreg) <- c("Tue","Wed","Thu","Fri","Sat","Sun")
+    tempfitarima <- auto.arima(temp,xreg=xreg)
+    xregtest <- model.matrix(~as.factor((testing_ts[testing_ts$gvkey==uniquegvkey[i],c("day")])$day))[,-1]
+    colnames(xregtest) <- c("Tue","Wed","Thu","Fri","Sat","Sun")
+    forarima <- forecast(tempfitarima,h=testingdays, xreg=xregtest) 
+  } else if((sum(xregphoto_temp)>= 1 & sum(xregtestphoto_temp)>= 1) & 
+            (nrow(training_ts[(is.na(training_ts$no_of_tweets) & training_ts$gvkey==uniquegvkey[i]),])==trainingdays | 
+             nrow(testing_ts[(is.na(testing_ts$no_of_tweets) & testing_ts$gvkey==uniquegvkey[i]),])==testingdays)) {
+    xreg <- cbind(day = model.matrix(~as.factor((training_ts[training_ts$gvkey==uniquegvkey[i],c("day")])$day))[,-1],
+                  photo = xregphoto_temp)
+    colnames(xreg) <- c("Tue","Wed","Thu","Fri","Sat","Sun","isphoto")
+    tempfitarima <- auto.arima(temp,xreg=xreg)
+    xregtest <- cbind(day = model.matrix(~as.factor((testing_ts[testing_ts$gvkey==uniquegvkey[i],c("day")])$day))[,-1],
+                      photo = xregtestphoto_temp)
+    colnames(xregtest) <- c("Tue","Wed","Thu","Fri","Sat","Sun","isphoto")
+    forarima <- forecast(tempfitarima,h=testingdays, xreg=xregtest)
+  } else if ((sum(xregphoto_temp)< 1 | sum(xregtestphoto_temp)< 1) & 
+             (nrow(training_ts[(is.na(training_ts$no_of_tweets) & training_ts$gvkey==uniquegvkey[i]),])<trainingdays | 
+              nrow(testing_ts[(is.na(testing_ts$no_of_tweets) & testing_ts$gvkey==uniquegvkey[i]),])<testingdays)){
+    xreg_tweetcount <- training_ts[training_ts$gvkey==uniquegvkey[i],c("no_of_tweets")]
+    xreg_tweetcount[is.na(xreg_tweetcount$no_of_tweets)] <- 0
+    xreg <- cbind(day = model.matrix(~as.factor((training_ts[training_ts$gvkey==uniquegvkey[i],c("day")])$day))[,-1],
+                  tweetcount = xreg_tweetcount)
+    colnames(xreg) <- c("Tue","Wed","Thu","Fri","Sat","Sun","no_of_tweets")
+    tempfitarima <- auto.arima(temp,xreg=xreg)
+    xregtest_tweetcount <- testing_ts[testing_ts$gvkey==uniquegvkey[i],c("no_of_tweets")]
+    xregtest_tweetcount[is.na(xregtest_tweetcount$no_of_tweets)] <- 0 
+    xregtest <- cbind(day = model.matrix(~as.factor((testing_ts[testing_ts$gvkey==uniquegvkey[i],c("day")])$day))[,-1],
+                      tweetcount = xregtest_tweetcount)
+    colnames(xregtest) <- c("Tue","Wed","Thu","Fri","Sat","Sun","no_of_tweets")
+    forarima <- forecast(tempfitarima,h=testingdays, xreg=xregtest)
+  } else {
+    xreg_tweetcount <- training_ts[training_ts$gvkey==uniquegvkey[i],c("no_of_tweets")]
+    xreg_tweetcount[is.na(xreg_tweetcount$no_of_tweets)] <- 0
+    xreg <- cbind(day = model.matrix(~as.factor((training_ts[training_ts$gvkey==uniquegvkey[i],c("day")])$day))[,-1],
+                  photo = xregphoto_temp,
+                  tweetcount = xreg_tweetcount)
+    colnames(xreg) <- c("Tue","Wed","Thu","Fri","Sat","Sun","isphoto","no_of_tweets")
+    tempfitarima <- auto.arima(temp,xreg=xreg)
+    xregtest_tweetcount <- testing_ts[testing_ts$gvkey==uniquegvkey[i],c("no_of_tweets")]
+    xregtest_tweetcount[is.na(xregtest_tweetcount$no_of_tweets)] <- 0 
+    xregtest <- cbind(day = model.matrix(~as.factor((testing_ts[testing_ts$gvkey==uniquegvkey[i],c("day")])$day))[,-1],
+                      photo = xregtestphoto_temp,
+                      tweetcount = xregtest_tweetcount)
+    colnames(xregtest) <- c("Tue","Wed","Thu","Fri","Sat","Sun","isphoto","no_of_tweets")
+    forarima <- forecast(tempfitarima,h=testingdays, xreg=xregtest)
+  }
+  accuracy <- accuracy(tempfitarima)
+  if(i==1){
+    insamplemae <- data.frame(gvkey=uniquegvkey[i], MAE=accuracy[3])
+  } else {
+    addinsamplemae <- data.frame(gvkey=uniquegvkey[i], MAE=accuracy[3])
+    insamplemae <- rbind(insamplemae, addinsamplemae)
+  }  
+  
+  if(i==1){
+    modelaicc <- data.frame(gvkey=uniquegvkey[i], AICc=tempfitarima$aicc)
+  } else {
+    addmodelaicc <- data.frame(gvkey=uniquegvkey[i], AICc=tempfitarima$aicc)
+    modelaicc <- rbind(modelaicc, addmodelaicc)
+  }
+  
+  cat("####", uniquegvkey[i], " \n")
+  cat(paste0("Arima model for gvkey: ",uniquegvkey[i]), " \n")
+  cat(paste0("AICc: ", round(tempfitarima$aicc,4)), " \n")
+  cat(paste0("Training Set MAE: ", round(accuracy[3],4)), " \n")
+  coef <- as.data.frame.numeric(tempfitarima$coef)
+  colnames(coef) <- "coefficient_value"
+  print(kable(coef) %>% kable_styling(bootstrap_options = 'striped',full_width = FALSE, position="left"))
+  plot(forarima, xaxt='n')
+  axis(side=1, at= seq(as.Date("2017-01-01"), as.Date("2017-10-01"), "months"),format(seq(as.Date("2017-01-01"), as.Date("2017-10-01"), "months"), "%b"), cex.axis = .7)
+  cat(' \n\n')
+  
+  if(nrow(coef)>0) {
+    coef$gvkey <- uniquegvkey[i]
+    coef <- tibble::rownames_to_column(coef,"name")
+    if(i==1){
+      coeflist <- coef
+    }else{
+      coeflist <- rbind(coeflist,coef)
+    }
+  }
+   
+  if(i==1){
+    predarima <- data.frame(date=testdates, gvkey=uniquegvkey[i], followers=as.numeric(forarima[[4]]))
+  } else {
+    addpredarima <- data.frame(date=testdates, gvkey=uniquegvkey[i], followers=as.numeric(forarima[[4]]))
+    predarima <- rbind(predarima, addpredarima)
+  }
+}
+model446mae <- insamplemae
+model446aicc <- modelaicc
+model446pred <- predarima
+coeflist446 <- coeflist
+```
+
+## 
+```{r tsam14coeflist, echo=FALSE }
+mediandf <- coeflist446[coeflist446$name != "drift",c("name","coefficient_value")] %>% 
+  group_by(name) %>% 
+  mutate(median = median(coefficient_value)) %>% 
+  ungroup()
+mediandf <- mediandf[,c("name","median")]
+colnames(mediandf) <- c("name","coefficient_value")
+mediandf$gvkey <- "median"  
+coeflist446 <- coeflist446[coeflist446$name != "drift",]
+coef446plot <-  ggplot(coeflist446,aes(x=name, y=coefficient_value)) +
+                  geom_point(aes(col=factor(gvkey)),shape=21, position=position_jitter(width = 0.1), fill='cyan') + 
+                  geom_errorbar(data=mediandf, width=0.6, aes(ymax=coefficient_value, ymin=coefficient_value), color="black")+
+                  geom_abline(slope=0, col="darkred",linetype="dashed")+
+                  theme(legend.position = "none") + 
+                  labs(x="Coefficient Name", y = "Coefficient Value", title = "Model 4.4.6 - Coefficient Values Plot")+
+                  theme(axis.text.x  = element_text(angle=45, hjust = 1))
+ggplotly(coef446plot) %>% 
+  layout(title = list(text = paste0('Model 4.4.6 - Coefficient Values Plot',
+                                    '<br>',
+                                    '<sup>',
+                                    '(black line represent the median value for the coefficient)',
+                                    '</sup>')))
+```
+
+
+## Model 4.4.7 - TIMESERIES MODEL 7: Followers with Day of the Week, No.of Tweets, No. of Tweets with Images and Tweet Sentiment Scores
+Timeseries model 7 predicts followers count using historical followers count data, and with four external (exogenous) variables - Day of the Week, Number of Tweets made in a day, Number of Tweets with Images made in a day, and Tweet Sentiment Score. Should any of the external variables are constant throughout the entire training/testing period (i.e. making it indifferent to include the variable), the model will be ran without this variable. If there is no tweet related data available for a particular gvkey throughout the entire training/testing data period, the model will predict followers count using the historical followers count data with external (exogenous) variable - Day of the Week.
+
+###  {.tabset .tabset-fade .tabset-dropdown}
+```{r tsam18, echo=FALSE, results='asis'}
+for (i in 1:95) {
+  temp <- training_ts[training_ts$gvkey==uniquegvkey[i],c("followers")]
+  temp <- na.approx(zoo(temp$followers, as.Date("2017-01-01") + 1:trainingdays-1), na.rm = FALSE)
+  temp <-  na_locf(temp$followers, option = 'nocb')
+  xregphoto_temp <- training_ts[training_ts$gvkey==uniquegvkey[i],c("isphoto")]
+  xregphoto_temp[is.na(xregphoto_temp$isphoto)] <- 0
+  xregtestphoto_temp <- testing_ts[testing_ts$gvkey==uniquegvkey[i],c("isphoto")]
+  xregtestphoto_temp[is.na(xregtestphoto_temp$isphoto)] <- 0
+  if((sum(xregphoto_temp)< 1 | sum(xregtestphoto_temp)< 1) & 
+     (nrow(training_ts[(is.na(training_ts$no_of_tweets) & training_ts$gvkey==uniquegvkey[i]),])==trainingdays | 
+      nrow(testing_ts[(is.na(testing_ts$no_of_tweets) & testing_ts$gvkey==uniquegvkey[i]),])==testingdays) &
+      (nrow(training_ts[(is.na(training_ts$dailymean_word_sen) & training_ts$gvkey==uniquegvkey[i]),])==trainingdays | 
+      nrow(testing_ts[(is.na(testing_ts$dailymean_word_sen) & testing_ts$gvkey==uniquegvkey[i]),])==testingdays)){
+    xreg <- model.matrix(~as.factor((training_ts[training_ts$gvkey==uniquegvkey[i],c("day")])$day))[,-1]
+    colnames(xreg) <- c("Tue","Wed","Thu","Fri","Sat","Sun")
+    tempfitarima <- auto.arima(temp,xreg=xreg)
+    xregtest <- model.matrix(~as.factor((testing_ts[testing_ts$gvkey==uniquegvkey[i],c("day")])$day))[,-1]
+    colnames(xregtest) <- c("Tue","Wed","Thu","Fri","Sat","Sun")
+    forarima <- forecast(tempfitarima,h=testingdays, xreg=xregtest) 
+  } else if ((sum(xregphoto_temp)< 1 | sum(xregtestphoto_temp)< 1) & 
+             (nrow(training_ts[(is.na(training_ts$no_of_tweets) & training_ts$gvkey==uniquegvkey[i]),])<trainingdays | 
+              nrow(testing_ts[(is.na(testing_ts$no_of_tweets) & testing_ts$gvkey==uniquegvkey[i]),])<testingdays) & 
+            (nrow(training_ts[(is.na(training_ts$dailymean_word_sen) & training_ts$gvkey==uniquegvkey[i]),])==trainingdays | 
+            nrow(testing_ts[(is.na(testing_ts$dailymean_word_sen) & testing_ts$gvkey==uniquegvkey[i]),])==testingdays)){
+    xreg_tweetcount <- training_ts[training_ts$gvkey==uniquegvkey[i],c("no_of_tweets")]
+    xreg_tweetcount[is.na(xreg_tweetcount$no_of_tweets)] <- 0
+    xreg <- cbind(day = model.matrix(~as.factor((training_ts[training_ts$gvkey==uniquegvkey[i],c("day")])$day))[,-1],
+                  tweetcount = xreg_tweetcount)
+    colnames(xreg) <- c("Tue","Wed","Thu","Fri","Sat","Sun","no_of_tweets")
+    tempfitarima <- auto.arima(temp,xreg=xreg)
+    xregtest_tweetcount <- testing_ts[testing_ts$gvkey==uniquegvkey[i],c("no_of_tweets")]
+    xregtest_tweetcount[is.na(xregtest_tweetcount$no_of_tweets)] <- 0 
+    xregtest <- cbind(day = model.matrix(~as.factor((testing_ts[testing_ts$gvkey==uniquegvkey[i],c("day")])$day))[,-1],
+                      tweetcount = xregtest_tweetcount)
+    colnames(xregtest) <- c("Tue","Wed","Thu","Fri","Sat","Sun","no_of_tweets")
+    forarima <- forecast(tempfitarima,h=testingdays, xreg=xregtest)
+  } else if ((sum(xregphoto_temp)< 1 | sum(xregtestphoto_temp)< 1) & 
+            (nrow(training_ts[(is.na(training_ts$no_of_tweets) & training_ts$gvkey==uniquegvkey[i]),])<trainingdays | 
+            nrow(testing_ts[(is.na(testing_ts$no_of_tweets) & testing_ts$gvkey==uniquegvkey[i]),])<testingdays) &
+            (nrow(training_ts[(is.na(training_ts$dailymean_word_sen) & training_ts$gvkey==uniquegvkey[i]),])<trainingdays | 
+            nrow(testing_ts[(is.na(testing_ts$dailymean_word_sen) & testing_ts$gvkey==uniquegvkey[i]),])<testingdays)) {
+    xreg_tweetcount <- training_ts[training_ts$gvkey==uniquegvkey[i],c("no_of_tweets")]
+    xreg_tweetcount[is.na(xreg_tweetcount$no_of_tweets)] <- 0
+    xreg_word <- training_ts[training_ts$gvkey==uniquegvkey[i],c("dailymean_word_sen")]
+    xreg_word [is.na(xreg_word$dailymean_word_sen)] <- 0
+    xreg <- cbind(day = model.matrix(~as.factor((training_ts[training_ts$gvkey==uniquegvkey[i],c("day")])$day))[,-1],
+                  tweetcount = xreg_tweetcount,
+                  word_sen = xreg_word)
+    colnames(xreg) <- c("Tue","Wed","Thu","Fri","Sat","Sun","no_of_tweets","dailymean_word_sen")
+    tempfitarima <- auto.arima(temp,xreg=xreg)
+    xregtest_tweetcount <- testing_ts[testing_ts$gvkey==uniquegvkey[i],c("no_of_tweets")]
+    xregtest_tweetcount[is.na(xregtest_tweetcount$no_of_tweets)] <- 0 
+    xregtest_word  <- testing_ts[testing_ts$gvkey==uniquegvkey[i],c("dailymean_word_sen")]
+    xregtest_word [is.na(xregtest_word$dailymean_word_sen)] <- 0 
+    xregtest <- cbind(day = model.matrix(~as.factor((testing_ts[testing_ts$gvkey==uniquegvkey[i],c("day")])$day))[,-1],
+                      tweetcount = xregtest_tweetcount,
+                      word_sen = xregtest_word)
+    colnames(xregtest) <- c("Tue","Wed","Thu","Fri","Sat","Sun","no_of_tweets","dailymean_word_sen")
+    forarima <- forecast(tempfitarima,h=testingdays, xreg=xregtest)
+  } else if ((sum(xregphoto_temp)> 1 | sum(xregtestphoto_temp)> 1) & 
+            (nrow(training_ts[(is.na(training_ts$no_of_tweets) & training_ts$gvkey==uniquegvkey[i]),])<trainingdays | 
+            nrow(testing_ts[(is.na(testing_ts$no_of_tweets) & testing_ts$gvkey==uniquegvkey[i]),])<testingdays) &
+            (nrow(training_ts[(is.na(training_ts$dailymean_word_sen) & training_ts$gvkey==uniquegvkey[i]),])==trainingdays | 
+            nrow(testing_ts[(is.na(testing_ts$dailymean_word_sen) & testing_ts$gvkey==uniquegvkey[i]),])==testingdays)) {
+    xreg_tweetcount <- training_ts[training_ts$gvkey==uniquegvkey[i],c("no_of_tweets")]
+    xreg_tweetcount[is.na(xreg_tweetcount$no_of_tweets)] <- 0
+    xreg <- cbind(day = model.matrix(~as.factor((training_ts[training_ts$gvkey==uniquegvkey[i],c("day")])$day))[,-1],
+                  photo = xregphoto_temp,
+                  tweetcount = xreg_tweetcount)
+    colnames(xreg) <- c("Tue","Wed","Thu","Fri","Sat","Sun","isphoto","no_of_tweets")
+    tempfitarima <- auto.arima(temp,xreg=xreg)
+    xregtest_tweetcount <- testing_ts[testing_ts$gvkey==uniquegvkey[i],c("no_of_tweets")]
+    xregtest_tweetcount[is.na(xregtest_tweetcount$no_of_tweets)] <- 0 
+    xregtest <- cbind(day = model.matrix(~as.factor((testing_ts[testing_ts$gvkey==uniquegvkey[i],c("day")])$day))[,-1],
+                      photo = xregtestphoto_temp,
+                      tweetcount = xregtest_tweetcount)
+    colnames(xregtest) <- c("Tue","Wed","Thu","Fri","Sat","Sun","isphoto","no_of_tweets")
+    forarima <- forecast(tempfitarima,h=testingdays, xreg=xregtest)
+  }else {
+    xreg_tweetcount <- training_ts[training_ts$gvkey==uniquegvkey[i],c("no_of_tweets")]
+    xreg_tweetcount[is.na(xreg_tweetcount$no_of_tweets)] <- 0
+    xreg_word <- training_ts[training_ts$gvkey==uniquegvkey[i],c("dailymean_word_sen")]
+    xreg_word [is.na(xreg_word$dailymean_word_sen)] <- 0
+    xreg <- cbind(day = model.matrix(~as.factor((training_ts[training_ts$gvkey==uniquegvkey[i],c("day")])$day))[,-1],
+                  photo = xregphoto_temp,
+                  tweetcount = xreg_tweetcount,
+                  word_sen = xreg_word)
+    colnames(xreg) <- c("Tue","Wed","Thu","Fri","Sat","Sun","isphoto","no_of_tweets","dailymean_word_sen")
+    tempfitarima <- auto.arima(temp,xreg=xreg)
+    xregtest_tweetcount <- testing_ts[testing_ts$gvkey==uniquegvkey[i],c("no_of_tweets")]
+    xregtest_tweetcount[is.na(xregtest_tweetcount$no_of_tweets)] <- 0 
+    xregtest_word  <- testing_ts[testing_ts$gvkey==uniquegvkey[i],c("dailymean_word_sen")]
+    xregtest_word [is.na(xregtest_word$dailymean_word_sen)] <- 0 
+    xregtest <- cbind(day = model.matrix(~as.factor((testing_ts[testing_ts$gvkey==uniquegvkey[i],c("day")])$day))[,-1],
+                      photo = xregtestphoto_temp,
+                      tweetcount = xregtest_tweetcount,
+                      word_sen = xregtest_word)
+    colnames(xregtest) <- c("Tue","Wed","Thu","Fri","Sat","Sun","isphoto","no_of_tweets","dailymean_word_sen")
+    forarima <- forecast(tempfitarima,h=testingdays, xreg=xregtest)
+  }
+  accuracy <- accuracy(tempfitarima)
+  if(i==1){
+    insamplemae <- data.frame(gvkey=uniquegvkey[i], MAE=accuracy[3])
+  } else {
+    addinsamplemae <- data.frame(gvkey=uniquegvkey[i], MAE=accuracy[3])
+    insamplemae <- rbind(insamplemae, addinsamplemae)
+  }  
+  
+  if(i==1){
+    modelaicc <- data.frame(gvkey=uniquegvkey[i], AICc=tempfitarima$aicc)
+  } else {
+    addmodelaicc <- data.frame(gvkey=uniquegvkey[i], AICc=tempfitarima$aicc)
+    modelaicc <- rbind(modelaicc, addmodelaicc)
+  }
+  
+  cat("####", uniquegvkey[i], " \n")
+  cat(paste0("Arima model for gvkey: ",uniquegvkey[i]), " \n")
+  cat(paste0("AICc: ", round(tempfitarima$aicc,4)), " \n")
+  cat(paste0("Training Set MAE: ", round(accuracy[3],4)), " \n")
+  coef <- as.data.frame.numeric(tempfitarima$coef)
+  colnames(coef) <- "coefficient_value"
+  print(kable(coef) %>% kable_styling(bootstrap_options = 'striped',full_width = FALSE, position="left"))
+  plot(forarima, xaxt='n')
+  axis(side=1, at= seq(as.Date("2017-01-01"), as.Date("2017-10-01"), "months"),format(seq(as.Date("2017-01-01"), as.Date("2017-10-01"), "months"), "%b"), cex.axis = .7)
+  cat(' \n\n')
+  
+  if(nrow(coef)>0) {
+    coef$gvkey <- uniquegvkey[i]
+    coef <- tibble::rownames_to_column(coef,"name")
+    if(i==1){
+      coeflist <- coef
+    }else{
+      coeflist <- rbind(coeflist,coef)
+    }
+  }
+   
+  if(i==1){
+    predarima <- data.frame(date=testdates, gvkey=uniquegvkey[i], followers=as.numeric(forarima[[4]]))
+  } else {
+    addpredarima <- data.frame(date=testdates, gvkey=uniquegvkey[i], followers=as.numeric(forarima[[4]]))
+    predarima <- rbind(predarima, addpredarima)
+  }
+}
+model447mae <- insamplemae
+model447aicc <- modelaicc
+model447pred <- predarima
+coeflist447 <- coeflist
+```
+
+## 
+```{r tsam18coeflist, echo=FALSE }
+mediandf <- coeflist447[coeflist447$name != "drift",c("name","coefficient_value")] %>% 
+  group_by(name) %>% 
+  mutate(median = median(coefficient_value)) %>% 
+  ungroup()
+mediandf <- mediandf[,c("name","median")]
+colnames(mediandf) <- c("name","coefficient_value")
+mediandf$gvkey <- "median"  
+coeflist447 <- coeflist447[coeflist447$name != "drift",]
+coef447plot <-  ggplot(coeflist447,aes(x=name, y=coefficient_value)) +
+                  geom_point(aes(col=factor(gvkey)),shape=21, position=position_jitter(width = 0.1), fill='cyan') + 
+                  geom_errorbar(data=mediandf, width=0.6, aes(ymax=coefficient_value, ymin=coefficient_value), color="black")+
+                  geom_abline(slope=0, col="darkred",linetype="dashed")+
+                  theme(legend.position = "none") + 
+                  labs(x="Coefficient Name", y = "Coefficient Value", title = "Model 4.4.7 - Coefficient Values Plot")+
+                  theme(axis.text.x  = element_text(angle=45, hjust = 1))
+ggplotly(coef447plot) %>% 
+  layout(title = list(text = paste0('Model 4.4.7 - Coefficient Values Plot',
+                                    '<br>',
+                                    '<sup>',
+                                    '(black line represent the median value for the coefficient)',
+                                    '</sup>')))
+```
+
+## Table 4.4.8 - Training MAE for timeseries models 4.4.1 to 4.4.7
+```{r tsMAE, echo=FALSE}
+trainingmae <- data.frame(Model = c("4.4.1","4.4.2","4.4.3","4.4.4","4.4.5","4.4.6","4.4.7"),
+                          Training_MAE = c(mean(model441mae$MAE), mean(model442mae$MAE), mean(model443mae$MAE), 
+                                            mean(model444mae$MAE), mean(model445mae$MAE), mean(model446mae$MAE), 
+                                            mean(model447mae$MAE)),
+                          Model_AICc = c(mean(model441aicc$AICc), mean(model442aicc$AICc), mean(model443aicc$AICc), 
+                                            mean(model444aicc$AICc), mean(model445aicc$AICc), mean(model446aicc$AICc), 
+                                            mean(model447aicc$AICc)))
+trainingmae <- trainingmae %>% kable() %>% kable_styling(bootstrap_options = 'striped',full_width = FALSE)
+trainingmae
+```
+
+```{r printsubmissionfile, echo=FALSE, eval=TRUE}
+submit441 <- left_join(test,model441pred, by=c("gvkey","date"))
+kaggleoutput("model441.csv",submit441)
+submit442 <- left_join(test,model442pred, by=c("gvkey","date"))
+kaggleoutput("model442.csv",submit442)
+submit443 <- left_join(test,model443pred, by=c("gvkey","date"))
+kaggleoutput("model443.csv",submit443)
+submit444 <- left_join(test,model444pred, by=c("gvkey","date"))
+kaggleoutput("model444.csv",submit444)
+submit445 <- left_join(test,model445pred, by=c("gvkey","date"))
+kaggleoutput("model445.csv",submit445)
+submit446 <- left_join(test,model446pred, by=c("gvkey","date"))
+kaggleoutput("model446.csv",submit446)
+submit447 <- left_join(test,model447pred, by=c("gvkey","date"))
+kaggleoutput("model447.csv",submit447)
+```
+
+
+
+
